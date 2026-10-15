@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: registry.videolan.org/vlc-debian-win64-3.0:20260820114402
+      # the image sets a non-root USER; the runner's state files are root-owned
+      options: --user root
     env:
       # the contrib archive VideoLAN built for the last commit that touched contrib/ before 3.0.24
       VLC_PREBUILT_CONTRIBS_URL: https://artifacts.videolan.org/vlc-3.0/win64/vlc-contrib-x86_64-w64-mingw32-910cc9cada6080dd777fbafb2ebdd0c24f702c30.tar.zst
