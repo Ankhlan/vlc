@@ -570,21 +570,27 @@ static char *ia_search_json( intf_sys_t *sys, const char *q, const char *collect
 {
     struct vlc_memstream ms;
     vlc_memstream_open( &ms );
-    /* plain words are ANDed; a query with quotes, a colon or an operator is passed as written */
+    /* plain words: all of them, in the title or in the creator (full-text ranks junk by
+     * downloads); a query with quotes, a colon or an operator is passed as written */
     if( strchr( q, '"' ) || strchr( q, ':' ) || strstr( q, " AND " ) || strstr( q, " OR " ) )
         vlc_memstream_printf( &ms, "(%s)", q );
     else
     {
         char *words = strdup( q ), *save = NULL;
-        vlc_memstream_putc( &ms, '(' );
+        struct vlc_memstream anded;
+        vlc_memstream_open( &anded );
         bool first = true;
         for( char *w = words ? strtok_r( words, " ", &save ) : NULL; w; w = strtok_r( NULL, " ", &save ) )
         {
-            vlc_memstream_printf( &ms, "%s%s", first ? "" : " AND ", w );
+            vlc_memstream_printf( &anded, "%s%s", first ? "" : " AND ", w );
             first = false;
         }
-        vlc_memstream_putc( &ms, ')' );
         free( words );
+        if( vlc_memstream_close( &anded ) == 0 )
+        {
+            vlc_memstream_printf( &ms, "(title:(%s) OR creator:(%s))", anded.ptr, anded.ptr );
+            free( anded.ptr );
+        }
     }
     vlc_memstream_puts( &ms, " AND (mediatype:audio OR mediatype:etree)" );
     if( collection && *collection )
