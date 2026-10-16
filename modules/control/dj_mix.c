@@ -805,6 +805,34 @@ static bool beat_track( const float *low, const float *kw, int64_t n0, int which
         if( hits == 0 ) goto out;
     }
 
+    /* read at half its tempo? Four to the floor at half speed has kicks between its beats too;
+       a boom bap's kicks fall there now and then, not on most */
+    if( 60000. / P < 100. )
+    {
+        int between = 0, slots = 0;
+        double w = P / 16.;
+        for( int k = 0; ; k++ )
+        {
+            double c = phi + (k + .5) * P;
+            if( c + w >= n - 1 ) break;
+            if( c - w < 1. ) continue;
+            slots++;
+            float v = 0.f;
+            for( int64_t i = (int64_t)ceil( c - w ); i <= (int64_t)floor( c + w ); i++ ) if( o[i] > v ) v = o[i];
+            if( v >= 1.5 * omean ) between++;
+        }
+        if( slots >= 16 && between >= 0.7 * slots )
+        {
+            P /= 2.;
+            for( int pass = 1; pass < 3; pass++ )
+            {
+                hits = beat_pass( o, n, lims[pass], 1.5 * omean, P / (pass == 1 ? 12. : 16.), &P, &phi, &jit, &sd,
+                                  &beats, bk, bt, bw, res );
+                if( hits == 0 ) goto out;
+            }
+        }
+    }
+
     /* claps and snares sit on 2 and 4: the parity with less of them starts the half bars */
     double ev = 0., od = 0.;
     int ne = 0, no = 0;
@@ -822,6 +850,21 @@ static bool beat_track( const float *low, const float *kw, int64_t n0, int which
         ev /= ne; od /= no;
         if( fabs( ev - od ) >= 0.08 * fmax( ev, od ) ) g->one = ev <= od ? 0 : 1;
     }
+    /* and of the two half bars, the one the whole band accents more starts the bar: the crash,
+       the bass's change; g->one counts beats modulo 4 from here */
+    double acc[2] = { 0., 0. };
+    for( int k = 0; ; k++ )
+    {
+        double c = phi + k * P;
+        if( c + P / 16. >= n ) break;
+        if( c - P / 16. < 0. ) continue;
+        int m = (int)((((long long)k - g->one) % 4 + 4) % 4);
+        if( m & 1 ) continue;
+        float v = 0.f;
+        for( int64_t i = (int64_t)(c - P / 16.); i <= (int64_t)(c + P / 16.); i++ ) if( ko[i] > v ) v = ko[i];
+        acc[m / 2] += v;
+    }
+    if( acc[1] > 1.1 * acc[0] ) g->one += 2;
     g->period = P;
     g->phase = r0 + phi;
     g->bpm = 60000. / P;
@@ -2177,8 +2220,10 @@ static void deck_info( const dj_mix_t *m, deck_t *d, dj_deck_info_t *o )
         o->src_bits = o->lossless ? f->audio.i_bitspersample : 0;
         break;
     }
-    if( o->kbps == 0 && d->item->p_stats )
-        o->kbps = (int)lroundf( d->item->p_stats->f_demux_bitrate * 8000.f );
+    /* not stated: bytes read over the seconds they decoded to; the deck reads far ahead of real
+       time, so the input's own rate overstates it as many times */
+    if( o->kbps == 0 && d->item->p_stats && w > 10 * DJ_RATE )
+        o->kbps = (int)(d->item->p_stats->i_demux_read_bytes * 8 * DJ_RATE / w / 1000);
     vlc_mutex_unlock( &d->item->lock );
 }
 

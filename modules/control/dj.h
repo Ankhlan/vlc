@@ -50,7 +50,7 @@ typedef struct
     double bpm;
     float  conf;          /* share of the grid's beats with a kick on them */
     float  jitter;        /* ms: how far the kicks sit off the grid */
-    int    one;           /* parity of the beats that start a half bar */
+    int    one;           /* the beat, modulo 4, that starts a bar */
     double drift;         /* ms the grid may wander over a 64-beat blend */
     double kick_from, kick_to;   /* deck frames: the stretch with the kick on, where it was fitted */
 } dj_grid_t;

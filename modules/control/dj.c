@@ -217,6 +217,11 @@ struct intf_sys_t
     dj_track_t     *crate;          /* what plays next */
     size_t          n_crate, cap_crate;
     int             cur_block, cur_pick, fill_block, fill_pick, air_block;
+    char          **own;            /* the DJ's own crate: dj-persona.json's "plays" */
+    size_t          n_own;
+    float           freedom;        /* the share of picks that are its own */
+    time_t          own_at;         /* the file's time when read */
+    int             set_from, set_len;   /* its own set, minutes from midnight, and long; -1 none */
     time_t          pick_started, hold_until, other_since, dry_until;
     int             dry_block;
     char           *said, *cur_label, *last_error, *live_url, *live_np, *say_next;
@@ -2015,6 +2020,100 @@ static int random_pick( const pblock_t *b )
     return b->n_picks ? (int)((unsigned long)vlc_mrand48() % b->n_picks) : 0;
 }
 
+/* The DJ's own music: dj-persona.json, the agent's file, says what it likes to play and how much
+ * of the time; the listener's programme is a preference, not a fence. Read again when it changes. */
+static void own_load( intf_sys_t *sys )
+{
+    char *dir = config_GetUserDir( VLC_CONFIG_DIR ), *path = NULL;
+    if( dir == NULL || asprintf( &path, "%s" DIR_SEP "dj-persona.json", dir ) < 0 ) path = NULL;
+    free( dir );
+    struct stat st;
+    time_t at = path && vlc_stat( path, &st ) == 0 ? st.st_mtime : 0;
+    if( at == sys->own_at )
+    {
+        free( path );
+        return;
+    }
+    sys->own_at = at;
+    for( size_t i = 0; i < sys->n_own; i++ ) free( sys->own[i] );
+    free( sys->own );
+    sys->own = NULL;
+    sys->n_own = 0;
+    sys->freedom = 0.f;
+    sys->set_from = -1;
+    sys->set_len = 0;
+    char *text = at ? read_file( path ) : NULL;
+    free( path );
+    if( text == NULL ) return;
+    json_settings settings;
+    memset( &settings, 0, sizeof settings );
+    char err[128];
+    json_value *root = json_parse_ex( &settings, text, err );
+    free( text );
+    if( root == NULL ) return;
+    const json_value *plays = root->type == json_object ? json_getbyname( root, "plays" ) : NULL;
+    const json_value *fr = root->type == json_object ? json_getbyname( root, "freedom" ) : NULL;
+    if( plays && plays->type == json_array && plays->u.array.length )
+    {
+        sys->own = calloc( plays->u.array.length, sizeof *sys->own );
+        for( unsigned i = 0; sys->own && i < plays->u.array.length; i++ )
+            if( plays->u.array.values[i]->type == json_string )
+                sys->own[sys->n_own++] = strdup( plays->u.array.values[i]->u.string.ptr );
+        sys->freedom = .3f;
+    }
+    if( fr && (fr->type == json_double || fr->type == json_integer) )
+        sys->freedom = fr->type == json_double ? (float)fr->u.dbl : (float)fr->u.integer;
+    const json_value *set = root->type == json_object ? json_getbyname( root, "set" ) : NULL;
+    if( set && set->type == json_object && sys->n_own )
+    {
+        sys->set_from = hhmm_parse( jsongetstring( set, "from" ) );
+        sys->set_len = (int)jint_or( set, "minutes", 60 );
+        if( sys->set_len < 15 ) sys->set_len = 15;
+        if( sys->set_len > 240 ) sys->set_len = 240;
+    }
+    if( !(sys->freedom >= 0.f) ) sys->freedom = 0.f;
+    if( sys->freedom > 1.f ) sys->freedom = 1.f;
+    json_value_free( root );
+    char what[64];
+    snprintf( what, sizeof what, "%zu of its own, %.0f %% of the time", sys->n_own, sys->freedom * 100. );
+    dj_log( sys, "own crate", what );
+}
+
+/* now and then a pick of the DJ's own, as often as its freedom says; always, asked for its choice */
+static bool own_set_now( const intf_sys_t *sys )
+{
+    if( sys->set_from < 0 ) return false;
+    int sec, m = minutes_now( time( NULL ), &sec );
+    return ((m - sys->set_from) % 1440 + 1440) % 1440 < sys->set_len;
+}
+
+static bool refill_own( intf_sys_t *sys, int block, bool always )
+{
+    own_load( sys );
+    always = always || own_set_now( sys );   /* its own set: all its own */
+    if( sys->n_own == 0 || (!always && (vlc_mrand48() & 0xffff) >= (long)(sys->freedom * 65536.f)) ) return false;
+    const char *target = sys->own[(unsigned long)vlc_mrand48() % sys->n_own];
+    size_t n;
+    char *err = NULL, *label = NULL, *mine = NULL;
+    item_t *items = resolve( sys, target, sys->per_pick, &n, &err, &label );
+    if( items == NULL )
+    {
+        dj_log( sys, "own pick failed", target );
+        free( err );
+        free( label );
+        return false;
+    }
+    if( asprintf( &mine, own_set_now( sys ) ? "%s, in the DJ's own set" : "%s, the DJ's own pick", label ? label : target ) < 0 ) mine = NULL;
+    crate_add( sys, items, n, block, -2, false, mine ? mine : label );
+    sys->fill_block = block;
+    dj_log( sys, "own pick", target );
+    free( mine );
+    free( label );
+    free( err );
+    items_free( items, n );
+    return true;
+}
+
 /* the block's next pick into the crate; a random one when the block is new */
 static bool refill( intf_sys_t *sys, int block, bool fresh )
 {
@@ -2022,6 +2121,8 @@ static bool refill( intf_sys_t *sys, int block, bool fresh )
     /* a block that gave nothing is asked again in a minute, not every second */
     time_t now = time( NULL );
     if( block == sys->dry_block && now < sys->dry_until ) return false;
+    own_load( sys );
+    if( (!fresh || own_set_now( sys )) && refill_own( sys, block, false ) ) return true;
     const pblock_t *b = &sys->blocks[block];
     int from = !fresh && sys->fill_block == block && sys->fill_pick >= 0 ? sys->fill_pick + 1
              : random_pick( b );
@@ -2442,7 +2543,7 @@ static char *do_choose( intf_sys_t *sys )
     int block = block_at( sys, time( NULL ) );
     sys->hold_until = 0;
     crate_clear( sys, false );
-    if( !refill( sys, block, true ) )
+    if( !refill_own( sys, block, true ) && !refill( sys, block, true ) )
         return json_error( "nothing in %s plays right now", sys->blocks[block].name );
     cue_next( sys, block );
     dj_mix_Next( sys->mix, DJ_NOW );
@@ -3042,6 +3143,7 @@ static int Open( vlc_object_t *obj )
     sys->duck = var_InheritInteger( intf, "dj-duck" );
     sys->password = var_InheritString( intf, "http-password" );
     sys->cur_block = sys->cur_pick = sys->fill_block = sys->fill_pick = sys->air_block = sys->dry_block = -1;
+    sys->set_from = -1;
     vlc_mutex_init( &sys->lock );
     vlc_mutex_init( &sys->qlock );
     vlc_cond_init( &sys->wait );
@@ -3135,6 +3237,8 @@ static void Close( vlc_object_t *obj )
     }
     for( size_t i = 0; sys->routes && i < sys->n_routes; i++ )
         if( sys->routes[i].url ) httpd_UrlDelete( sys->routes[i].url );
+    for( size_t i = 0; i < sys->n_own; i++ ) free( sys->own[i] );
+    free( sys->own );
     free( sys->routes );
     if( sys->host ) httpd_HostDelete( sys->host );
     if( sys->mix ) dj_mix_Delete( sys->mix );
