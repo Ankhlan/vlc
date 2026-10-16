@@ -806,8 +806,9 @@ static bool beat_track( const float *low, const float *kw, int64_t n0, int which
     }
 
     /* read at half its tempo? Four to the floor at half speed has kicks between its beats too;
-       a boom bap's kicks fall there now and then, not on most */
-    if( 60000. / P < 100. )
+       a boom bap's kicks fall there now and then, not on most. Only where the double is a club
+       tempo: a rock drummer's kicks between the beats would make Californication 196 BPM */
+    if( 60000. / P <= 80. )
     {
         int between = 0, slots = 0;
         double w = P / 16.;
