@@ -103,8 +103,6 @@ void dj_mix_Clear( dj_mix_t * );                      /* both decks out */
 void dj_mix_Duck( dj_mix_t *, float db );
 void dj_mix_Status( dj_mix_t *, dj_status_t * );
 void dj_mix_StatusClean( dj_status_t * );
-/* n columns of a deck's waveform from..to seconds around what is heard: the kick band and
- * the whole, as amplitudes; -1 where nothing was read */
 /* the record from from_s to to_s, its own seconds, in n columns of amplitude: kick band and
    K-weighted; -1 where nothing is read yet or no longer kept */
 void dj_mix_Wave( dj_mix_t *, int deck, double from_s, double to_s, int n, float *low, float *full );

@@ -77,13 +77,9 @@ void dj_ui_Delete( dj_ui_t *ui ) { VLC_UNUSED(ui); }
 #endif
 #define WM_APP_SHOW   (WM_APP + 1)
 #define WM_APP_QUIT   (WM_APP + 2)
-#define WM_APP_DOCK   (WM_APP + 3)   /* lParam: the host's window; NULL, one of its own */
-#define WM_APP_REMAKE (WM_APP + 4)   /* a host took the deck's window down with its own */
+#define WM_APP_HOST   (WM_APP + 3)   /* lParam: a host shows the deck, or no longer */
 #define CLASS_NAME    L"VLCDJDeck"
 #define POST_CLASS    L"VLCDJDeckPost"
-#ifndef WM_DPICHANGED_AFTERPARENT
-# define WM_DPICHANGED_AFTERPARENT 0x02E3
-#endif
 #define ID_EDIT       101
 #define ID_FRAME      1
 #define ID_PLACE      2
@@ -161,10 +157,10 @@ struct dj_ui
     vlc_mutex_t    lock;
     vlc_cond_t     cond;
     int            up;                  /* 0 starting, 1 up, -1 failed; lock */
-    HWND           post;                /* message only: other threads post here; the deck's window comes and goes */
+    HWND           post;                /* message only: what other threads post to */
     HWND           hwnd, edit;
-    HWND           parent;              /* the host's window, docked; NULL, one of its own */
-    bool           quitting, first;
+    bool           hosted;              /* a host shows the deck: this window stays hidden */
+    bool           first;
     RECT           place;               /* where it last stood alone */
     bool           placed;
 
@@ -1886,10 +1882,7 @@ static void copy_box( canvas_t *dst, const canvas_t *src, box_t b )
 static void frame( dj_ui_t *ui )
 {
     canvas_t *cv = &ui->frame, *mid = &ui->mid;
-    RECT cr, pr;
-    if( ui->parent && GetClientRect( ui->parent, &pr ) && GetClientRect( ui->hwnd, &cr )   /* docked: the host's size */
-     && (pr.right != cr.right || pr.bottom != cr.bottom) )
-        SetWindowPos( ui->hwnd, NULL, 0, 0, pr.right, pr.bottom, SWP_NOZORDER | SWP_NOACTIVATE );
+    RECT cr;
     if( GetClientRect( ui->hwnd, &cr ) && (cr.right != cv->w || cr.bottom != cv->h) ) resize( ui, cr.right, cr.bottom );
     if( cv->px == NULL || mid->px == NULL || ui->chrome.px == NULL ) return;
     size_t bytes = (size_t)cv->w * cv->h * sizeof *cv->px;
@@ -1961,22 +1954,22 @@ static dj_ui_t *host_ui;               /* host_lock */
 static void (*host_show)( void * );    /* host_lock */
 static void *host_opaque;              /* host_lock */
 
-/* docked, the host shows the deck: its page in VLC's window */
+/* hosted, the host shows the deck: its page in VLC's window */
 static bool host_wants( dj_ui_t *ui )
 {
-    if( ui->parent == NULL ) return false;
+    if( !ui->hosted ) return false;
     vlc_mutex_lock( &host_lock );
     if( host_show ) host_show( host_opaque );
     vlc_mutex_unlock( &host_lock );
     return true;
 }
 
-/* where the window stood alone, and the records' zoom; docked, it keeps the last place */
+/* where the window stood, and the records' zoom */
 static void place_save( dj_ui_t *ui )
 {
     WINDOWPLACEMENT wp = { .length = sizeof wp };
     if( ui->place_path == NULL ) return;
-    if( ui->hwnd && ui->parent == NULL && GetWindowPlacement( ui->hwnd, &wp ) )
+    if( ui->hwnd && GetWindowPlacement( ui->hwnd, &wp ) )
     {
         bool max = wp.showCmd == SW_SHOWMAXIMIZED || (IsIconic( ui->hwnd ) && (wp.flags & WPF_RESTORETOMAXIMIZED));
         if( IsWindowVisible( ui->hwnd ) ) ui->maximized = max;
@@ -2074,44 +2067,15 @@ static void show( dj_ui_t *ui )
     else if( IsIconic( ui->hwnd ) ) ShowWindow( ui->hwnd, SW_RESTORE );
     SetForegroundWindow( ui->hwnd );
 }
-/* into the host's window, filling it; parent NULL, a window of its own again, hidden */
-static void dock( dj_ui_t *ui, HWND parent )
+/* a host shows the deck now, or no longer: meanwhile this window hides */
+static void host( dj_ui_t *ui, bool on )
 {
-    HWND hwnd = ui->hwnd;
-    if( hwnd == NULL || parent == ui->parent || (parent && !IsWindow( parent )) ) return;
-    if( ui->parent == NULL ) place_save( ui );
-    ShowWindow( hwnd, SW_HIDE );
-    if( parent )
+    if( on && ui->hwnd && IsWindowVisible( ui->hwnd ) )
     {
-        SetWindowLongPtrW( hwnd, GWL_STYLE, WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS );
-        SetWindowLongPtrW( hwnd, GWL_EXSTYLE, WS_EX_NOPARENTNOTIFY );
-        if( SetParent( hwnd, parent ) )
-        {
-            RECT r;
-            ui->parent = parent;
-            GetClientRect( parent, &r );
-            SetWindowPos( hwnd, HWND_TOP, 0, 0, r.right, r.bottom, SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW );
-            dpi_check( ui );
-            return;
-        }
-        msg_Warn( ui->obj, "the deck did not dock (error %lu): it keeps a window of its own", GetLastError() );
+        place_save( ui );
+        ShowWindow( ui->hwnd, SW_HIDE );
     }
-    else
-    {
-        SetParent( hwnd, NULL );
-        ui->parent = NULL;
-    }
-    SetWindowLongPtrW( hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN );
-    SetWindowLongPtrW( hwnd, GWL_EXSTYLE, WS_EX_APPWINDOW );
-    SetWindowPos( hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED );
-    WINDOWPLACEMENT wp = { .length = sizeof wp };
-    if( ui->placed && GetWindowPlacement( hwnd, &wp ) )
-    {
-        wp.rcNormalPosition = ui->place;
-        wp.showCmd = SW_HIDE;
-        SetWindowPlacement( hwnd, &wp );
-    }
-    dpi_check( ui );
+    ui->hosted = on;
 }
 
 static int hit( const dj_ui_t *ui, int x, int y )
@@ -2143,7 +2107,7 @@ static LRESULT CALLBACK EditProc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
     if( msg == WM_KEYDOWN && wp == VK_ESCAPE )
     {
         SetWindowTextW( hwnd, L"" );
-        SetFocus( ui->parent ? GetAncestor( ui->hwnd, GA_ROOT ) : ui->hwnd );
+        SetFocus( ui->hwnd );
         return 0;
     }
     if( msg == WM_CHAR && (wp == 13 || wp == 27) ) return 0;   /* no beep */
@@ -2171,12 +2135,8 @@ static LRESULT CALLBACK WndProc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
             if( wp != SIZE_MINIMIZED ) resize( ui, LOWORD( lp ), HIWORD( lp ) );
             return 0;
         case WM_GETMINMAXINFO:
-            if( ui->parent ) break;   /* docked, the host sizes it */
             ((MINMAXINFO *)lp)->ptMinTrackSize.x = S( ui, 1100 );
             ((MINMAXINFO *)lp)->ptMinTrackSize.y = S( ui, 720 );
-            return 0;
-        case WM_DPICHANGED_AFTERPARENT:   /* docked, onto another monitor with the host */
-            dpi_check( ui );
             return 0;
         case WM_DPICHANGED:
         {
@@ -2188,8 +2148,8 @@ static LRESULT CALLBACK WndProc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
                           SWP_NOZORDER | SWP_NOACTIVATE );
             return 0;
         }
-        case WM_TIMER:   /* drawn while seen: not hidden, nor minimised, nor the window it is docked in */
-            if( IsWindowVisible( hwnd ) && !IsIconic( GetAncestor( hwnd, GA_ROOT ) ) ) frame( ui );
+        case WM_TIMER:
+            if( IsWindowVisible( hwnd ) && !IsIconic( hwnd ) ) frame( ui );
             return 0;
         case WM_ERASEBKGND:
             return 1;
@@ -2214,9 +2174,8 @@ static LRESULT CALLBACK WndProc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
             ui->hover_id = ui->hover_arg = 0;
             ui->mid_dirty = true;
             return 0;
-        case WM_LBUTTONDOWN:   /* docked, the keys stay with the host: VLC's own shortcuts */
-            if( ui->parent == NULL ) SetFocus( hwnd );
-            else if( ui->edit_focus ) SetFocus( GetAncestor( hwnd, GA_ROOT ) );
+        case WM_LBUTTONDOWN:
+            SetFocus( hwnd );
             SetCapture( hwnd );
             hover_at( ui, GET_X_LPARAM( lp ), GET_Y_LPARAM( lp ) );
             ui->press_id = ui->hover_id;
@@ -2252,24 +2211,21 @@ static LRESULT CALLBACK WndProc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
             SetBkColor( (HDC)wp, cref( ui->c[C_BG] ) );
             return (LRESULT)ui->edit_brush;
         case WM_KEYDOWN:
-            if( wp == VK_ESCAPE && ui->parent ) { SetFocus( GetAncestor( hwnd, GA_ROOT ) ); return 0; }
             if( wp == VK_ESCAPE ) { place_save( ui ); ShowWindow( hwnd, SW_HIDE ); return 0; }
             break;
         case WM_CLOSE:   /* hidden, not gone: View > DJ brings it back */
             place_save( ui );
             ShowWindow( hwnd, SW_HIDE );
             return 0;
-        case WM_DESTROY:   /* the DJ's doing; or a host's, taking its own window down with the deck in it */
+        case WM_DESTROY:
             KillTimer( hwnd, ID_FRAME );
-            if( ui->hwnd == hwnd ) ui->hwnd = ui->edit = NULL;
-            ui->parent = NULL;
-            if( !ui->quitting ) PostMessageW( ui->post, WM_APP_REMAKE, 0, 0 );
+            ui->hwnd = ui->edit = NULL;
             return 0;
     }
     return DefWindowProcW( hwnd, msg, wp, lp );
 }
 
-/* the deck's window: one of its own, hidden, where it last stood */
+/* the deck's window, hidden, where it last stood */
 static bool window_make( dj_ui_t *ui )
 {
     HWND hwnd = CreateWindowExW( WS_EX_APPWINDOW, CLASS_NAME, L"VLC DJ", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
@@ -2328,18 +2284,13 @@ static LRESULT CALLBACK PostProc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
             KillTimer( hwnd, ID_PLACE );
             show( ui );
             return 0;
-        case WM_APP_DOCK:
-            dock( ui, (HWND)lp );
-            return 0;
-        case WM_APP_REMAKE:
-            if( ui->hwnd == NULL && !ui->quitting && !window_make( ui ) )
-                msg_Err( ui->obj, "the deck window did not come back" );
+        case WM_APP_HOST:
+            host( ui, lp != 0 );
             return 0;
         case WM_APP_QUIT:
-            ui->quitting = true;
             if( ui->hwnd )
             {
-                if( ui->parent || IsWindowVisible( ui->hwnd ) ) place_save( ui );
+                if( IsWindowVisible( ui->hwnd ) ) place_save( ui );
                 DestroyWindow( ui->hwnd );
             }
             DestroyWindow( hwnd );
@@ -2432,8 +2383,8 @@ static void ui_free( dj_ui_t *ui )
     free( ui );
 }
 
-/* the host's thread */
-static bool HostDock( void *parent, void (*cb)( void * ), void *opaque )
+/* the host's thread; each holds host_lock, so the deck it reads cannot go meanwhile */
+static bool HostAttach( void (*cb)( void * ), void *opaque )
 {
     vlc_mutex_lock( &host_lock );
     dj_ui_t *ui = host_ui;
@@ -2441,24 +2392,54 @@ static bool HostDock( void *parent, void (*cb)( void * ), void *opaque )
     {
         host_show = cb;
         host_opaque = opaque;
-        PostMessageW( ui->post, WM_APP_DOCK, 0, (LPARAM)parent );
+        PostMessageW( ui->post, WM_APP_HOST, 0, 1 );
     }
     vlc_mutex_unlock( &host_lock );
     return ui != NULL;
 }
 
-static void HostUndock( void )
+static void HostDetach( void )
 {
     vlc_mutex_lock( &host_lock );
-    HWND post = host_ui ? host_ui->post : NULL;
     host_show = NULL;
     host_opaque = NULL;
+    if( host_ui ) PostMessageW( host_ui->post, WM_APP_HOST, 0, 0 );
     vlc_mutex_unlock( &host_lock );
-    DWORD_PTR res;
-    if( post ) SendMessageTimeoutW( post, WM_APP_DOCK, 0, 0, SMTO_NORMAL, 3000, &res );
 }
 
-static dj_host_t host_api = { HostDock, HostUndock };
+static bool HostStatus( dj_status_t *st, dj_brain_t *br )
+{
+    vlc_mutex_lock( &host_lock );
+    dj_ui_t *ui = host_ui;
+    if( ui )
+    {
+        dj_mix_Status( ui->mix, st );
+        if( ui->brain_cb ) ui->brain_cb( ui->opaque, br );
+        else memset( br, 0, sizeof *br );
+    }
+    vlc_mutex_unlock( &host_lock );
+    return ui != NULL;
+}
+
+static bool HostWave( int deck, double from_s, double to_s, int n, float *low, float *full )
+{
+    vlc_mutex_lock( &host_lock );
+    dj_ui_t *ui = host_ui;
+    if( ui ) dj_mix_Wave( ui->mix, deck, from_s, to_s, n, low, full );
+    vlc_mutex_unlock( &host_lock );
+    return ui != NULL;
+}
+
+static bool HostCommand( const char *verb )
+{
+    vlc_mutex_lock( &host_lock );
+    dj_ui_t *ui = host_ui;
+    bool ok = ui && ui->command_cb && ui->command_cb( ui->opaque, verb );
+    vlc_mutex_unlock( &host_lock );
+    return ok;
+}
+
+static dj_host_t host_api = { HostAttach, HostDetach, HostStatus, dj_mix_StatusClean, HostWave, HostCommand };
 
 dj_ui_t *dj_ui_New( vlc_object_t *obj, dj_mix_t *mix, dj_brain_cb brain, dj_command_cb cmd, void *opaque,
                     const char *theme_path )
