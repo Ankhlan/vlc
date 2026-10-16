@@ -33,10 +33,16 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QDateTime>
 #include <QDir>
+#include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QFile>
 #include <QIcon>
 #include <QTextStream>
+#include <QTime>
 #include <QPainter>
 #include <QPainterPath>
 #include <QProgressBar>
@@ -57,6 +63,16 @@ struct DjNow
     bool        have;
     mtime_t     at, error_at;
     char        error_seen[240];
+};
+
+/* who the DJ says it is: dj-persona.json, written by the DJ's agent */
+struct DjPersona
+{
+    QString path, name, tagline, run;
+    QStringList wear;           /* sunglasses, beanie, chain */
+    QColor phones, beanie;
+    int setFrom, setLen;        /* its own set: minutes from midnight; -1 none */
+    QDateTime stamp;
 };
 
 static QString clock( double s )
@@ -246,8 +262,8 @@ private:
 class DjAvatar : public QWidget
 {
 public:
-    DjAvatar( const DjNow *n, const DjRecords *r, QWidget *parent )
-        : QWidget( parent ), now( n ), rec( r ), cone( ":/logo/vlc256.png" )
+    DjAvatar( const DjNow *n, const DjRecords *r, const DjPersona *pe, QWidget *parent )
+        : QWidget( parent ), now( n ), rec( r ), persona( pe ), cone( ":/logo/vlc256.png" )
     {
         setFixedSize( 72, 80 );
     }
@@ -280,6 +296,7 @@ protected:
         p.translate( -128., -256. );
         p.setOpacity( on ? 1. : .5 );
         p.drawPixmap( 0, 0, cone );
+        wear( p );
         if( !on ) return;
         QPainterPath band;   /* over the tip, from cup to cup */
         band.moveTo( 86, 60 );
@@ -289,8 +306,9 @@ protected:
         p.setPen( QPen( QColor( 0x6a, 0x6a, 0x6a ), 3, Qt::SolidLine, Qt::RoundCap ) );
         p.drawPath( band );
         QLinearGradient shell( 0, 50, 0, 106 );
-        shell.setColorAt( 0., QColor( 0x55, 0x55, 0x55 ) );
-        shell.setColorAt( 1., QColor( 0x22, 0x22, 0x22 ) );
+        QColor tone = persona->phones.isValid() ? persona->phones : QColor( 0x3a, 0x3a, 0x3a );
+        shell.setColorAt( 0., tone.lighter( 150 ) );
+        shell.setColorAt( 1., tone.darker( 160 ) );
         QColor rim = palette().color( QPalette::Highlight );
         for( int side = 0; side < 2; side++ )
         {
@@ -302,8 +320,60 @@ protected:
     }
 
 private:
+    /* what the DJ chose to wear, in the cone's own 256 pixels */
+    void wear( QPainter &p )
+    {
+        const QStringList &w = persona->wear;
+        if( w.contains( "beanie" ) )
+        {
+            QColor c = persona->beanie.isValid() ? persona->beanie : QColor( 0x2d, 0x5f, 0xa8 );
+            QPainterPath cap;
+            cap.moveTo( 98, 50 );
+            cap.cubicTo( 100, -4, 156, -4, 158, 50 );
+            cap.closeSubpath();
+            p.setPen( Qt::NoPen );
+            p.setBrush( c );
+            p.drawPath( cap );
+            p.setBrush( c.darker( 125 ) );
+            p.drawRoundedRect( QRectF( 94, 40, 68, 16 ), 6, 6 );
+            p.setBrush( c.lighter( 140 ) );
+            p.drawEllipse( QPointF( 128, 4 ), 10, 10 );
+        }
+        if( w.contains( "sunglasses" ) )
+        {
+            p.setPen( QPen( QColor( 0x11, 0x11, 0x11 ), 4 ) );
+            p.drawLine( QPointF( 122, 104 ), QPointF( 134, 104 ) );
+            QLinearGradient lens( 0, 96, 0, 118 );
+            lens.setColorAt( 0., QColor( 0x44, 0x44, 0x44 ) );
+            lens.setColorAt( 1., QColor( 0x08, 0x08, 0x08 ) );
+            p.setBrush( lens );
+            p.setPen( QPen( QColor( 0x11, 0x11, 0x11 ), 2 ) );
+            p.drawRoundedRect( QRectF( 88, 96, 36, 22 ), 8, 8 );
+            p.drawRoundedRect( QRectF( 132, 96, 36, 22 ), 8, 8 );
+            p.setPen( QPen( QColor( 255, 255, 255, 90 ), 2 ) );
+            p.drawLine( QPointF( 94, 101 ), QPointF( 104, 101 ) );
+            p.drawLine( QPointF( 138, 101 ), QPointF( 148, 101 ) );
+        }
+        if( w.contains( "chain" ) )
+        {
+            QColor gold( 0xe8, 0xb9, 0x3a );
+            p.setPen( QPen( gold.darker( 130 ), 1 ) );
+            p.setBrush( gold );
+            for( int i = 0; i <= 16; i++ )
+            {
+                double t = i / 16., x = 70 + t * 116, y = 176 + 26 * sin( t * M_PI );
+                p.drawEllipse( QPointF( x, y ), 4.5, 4.5 );
+            }
+            p.setBrush( QColor( 0x18, 0x18, 0x18 ) );   /* a record for a pendant */
+            p.drawEllipse( QPointF( 128, 214 ), 13, 13 );
+            p.setBrush( gold );
+            p.drawEllipse( QPointF( 128, 214 ), 4.5, 4.5 );
+        }
+    }
+
     const DjNow *now;
     const DjRecords *rec;
+    const DjPersona *persona;
     QPixmap cone;
 };
 
@@ -503,7 +573,7 @@ static QString runner()
 }
 
 DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
-    : QWidget( parent ), p_intf( _p_intf ), host( NULL ), now( new DjNow ), ticks( 0 )
+    : QWidget( parent ), p_intf( _p_intf ), host( NULL ), now( new DjNow ), persona( new DjPersona ), ticks( 0 )
 {
     memset( now, 0, sizeof *now );
     QVBoxLayout *main = new QVBoxLayout( this );
@@ -523,29 +593,28 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
     voice->addItem( qtr( "Voice between blocks" ) );
     voice->addItem( qtr( "Voice over everything" ) );
     records = new DjRecords( now, this );
-    avatar = new DjAvatar( now, records, this );
+    char *dir = config_GetUserDir( VLC_CONFIG_DIR );
+    persona->path = qfu( dir ? dir : "" ) + "/dj-persona.json";
+    free( dir );
+    avatar = new DjAvatar( now, records, persona, this );
     said = new QLabel;   /* what the DJ says, or means to do */
     said->setWordWrap( true );
     said->setSizePolicy( QSizePolicy::Ignored, QSizePolicy::Preferred );
     QFont italic = said->font();
     italic.setItalic( true );
     said->setFont( italic );
-    QLabel *name = new QLabel( qtr( "DJ" ) ), *card = new QLabel;
+    stage = new QLabel( qtr( "DJ" ) );
+    card = new QLabel;
     QFont big = bold;
     big.setPointSizeF( big.pointSizeF() * 1.25 );
-    name->setFont( big );
-    QString run = runner();
-    card->setText( run.isEmpty() ? qtr( "the dj module" ) : run );
+    stage->setFont( big );
+    card->setSizePolicy( QSizePolicy::Ignored, QSizePolicy::Preferred );
     quiet( card );
-    QString about = qtr( "The DJ in VLC is the dj module: it keeps the programme, picks the records and mixes them." );
-    if( !run.isEmpty() ) about += " " + qtr( "Requests from Claude go through the dj agent: %1." ).arg( run );
-    avatar->setToolTip( about );
-    card->setToolTip( about );
+    persona->run = runner();
     QHBoxLayout *ident = new QHBoxLayout;
-    ident->addWidget( name );
+    ident->addWidget( stage );
     ident->addSpacing( 8 );
-    ident->addWidget( card );
-    ident->addStretch();
+    ident->addWidget( card, 1 );
     QHBoxLayout *when = new QHBoxLayout;
     when->addWidget( block );
     when->addSpacing( 12 );
@@ -702,9 +771,54 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
     timer->setInterval( 33 );
     connect( timer, &QTimer::timeout, this, &DjDeck::tick );
 
+    dress();
     var_Create( THEPL, DJ_HOST_VAR, VLC_VAR_ADDRESS );
     var_AddCallback( THEPL, DJ_HOST_VAR, HostChanged, this );
     attach();
+}
+
+/* the name, the line and the wardrobe the DJ chose for itself, again whenever it chooses */
+void DjDeck::dress()
+{
+    QFileInfo fi( persona->path );
+    QDateTime at = fi.exists() ? fi.lastModified() : QDateTime();
+    if( at == persona->stamp && !persona->stamp.isNull() ) return;
+    persona->stamp = at;
+    persona->name.clear();
+    persona->tagline.clear();
+    persona->wear.clear();
+    persona->phones = persona->beanie = QColor();
+    persona->setFrom = -1;
+    persona->setLen = 0;
+    QFile f( persona->path );
+    if( f.open( QIODevice::ReadOnly ) )
+    {
+        QJsonObject o = QJsonDocument::fromJson( f.readAll() ).object();
+        persona->name = o.value( "name" ).toString().left( 40 );
+        persona->tagline = o.value( "tagline" ).toString().left( 120 );
+        QJsonObject a = o.value( "avatar" ).toObject();
+        QJsonArray w = a.value( "wear" ).toArray();
+        for( int i = 0; i < w.size(); i++ ) persona->wear << w.at( i ).toString();
+        persona->phones = QColor( a.value( "headphones" ).toString() );
+        persona->beanie = QColor( a.value( "beanie" ).toString() );
+        QJsonObject set = o.value( "set" ).toObject();
+        QTime from = QTime::fromString( set.value( "from" ).toString(), "HH:mm" );
+        if( from.isValid() && !o.value( "plays" ).toArray().isEmpty() )
+        {
+            persona->setFrom = from.hour() * 60 + from.minute();
+            persona->setLen = qBound( 15, set.value( "minutes" ).toInt( 60 ), 240 );
+        }
+    }
+    stage->setText( persona->name.isEmpty() ? qtr( "DJ" ) : persona->name );
+    QString run = persona->run.isEmpty() ? qtr( "the dj module" ) : persona->run;
+    card->setText( persona->tagline.isEmpty() ? run : persona->tagline + qfu( " \xc2\xb7 " ) + run );
+    QString about = qtr( "The DJ in VLC is the dj module: it keeps the programme, picks the records and mixes them." );
+    if( !persona->run.isEmpty() ) about += " " + qtr( "Requests from Claude go through the dj agent: %1." ).arg( persona->run );
+    about += " " + qtr( "It chose its own name and look: %1" ).arg( persona->path );
+    avatar->setToolTip( about );
+    card->setToolTip( about );
+    stage->setToolTip( about );
+    avatar->update();
 }
 
 DjDeck::~DjDeck()
@@ -715,6 +829,7 @@ DjDeck::~DjDeck()
     var_Destroy( THEPL, DJ_HOST_VAR );
     if( now->have && host ) host->status_clean( &now->st );
     delete now;
+    delete persona;
 }
 
 /* any thread: the DJ came or went */
@@ -798,6 +913,7 @@ void DjDeck::tick()
             spin->setPixmap( QIcon( QString( ":/util/wait%1.svg" ).arg( ticks / 4 % 4 + 1 ) ).pixmap( 16, 16 ) );
         spin->setVisible( now->br.busy );
     }
+    if( ticks % 160 == 0 ) dress();   /* every five seconds */
     if( ticks++ % 8 == 0 ) words();
 }
 
@@ -837,7 +953,18 @@ void DjDeck::words()
     const QString dot = qfu( " \xc2\xb7 " );
 
     block->setText( qfu( br->block ) );
-    nextBlock->setText( br->next_block[0] ? qtr( "Next: %1 at %2" ).arg( qfu( br->next_block ), qfu( br->next_at ) ) : QString() );
+    QString nb = br->next_block[0] ? qtr( "Next: %1 at %2" ).arg( qfu( br->next_block ), qfu( br->next_at ) ) : QString();
+    if( persona->setFrom >= 0 )   /* the DJ's own set, its music only */
+    {
+        QTime t = QTime::currentTime();
+        int into = ((t.hour() * 60 + t.minute() - persona->setFrom) % 1440 + 1440) % 1440;
+        QString who = persona->name.isEmpty() ? qtr( "The DJ" ) : persona->name;
+        QString end = QTime( 0, 0 ).addSecs( (persona->setFrom + persona->setLen) % 1440 * 60 ).toString( "HH:mm" );
+        QString start = QTime( 0, 0 ).addSecs( persona->setFrom * 60 ).toString( "HH:mm" );
+        nb = into < persona->setLen ? qtr( "%1's own set, until %2" ).arg( who, end )
+                                    : nb + (nb.isEmpty() ? QString() : qfu( " \xc2\xb7 " )) + qtr( "%1's set at %2" ).arg( who, start );
+    }
+    nextBlock->setText( nb );
     air->setChecked( br->on_air );
     if( !voice->view()->isVisible() )
         voice->setCurrentIndex( qBound( 0, br->voice, 2 ) );

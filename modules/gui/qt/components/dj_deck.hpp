@@ -32,6 +32,7 @@
 
 struct dj_host;
 struct DjNow;
+struct DjPersona;
 class DjRecords;
 class DjAvatar;
 class DjTurntable;
@@ -82,14 +83,16 @@ private:
     void command( const QString & );
     void request( const QString &, bool queue );
     void words();
+    void dress();
 
     intf_thread_t         *p_intf;
     const struct dj_host  *host;
     DjNow                 *now;
+    DjPersona             *persona;
     QTimer                *timer;
     int                    ticks;
 
-    QLabel       *block, *nextBlock, *said, *mixLine, *transition, *sync;
+    QLabel       *block, *nextBlock, *said, *mixLine, *transition, *sync, *stage, *card;
     QCheckBox    *air;
     QComboBox    *voice;
     DjRecords    *records;
