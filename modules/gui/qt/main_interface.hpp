@@ -43,6 +43,7 @@ class QLabel;
 class QEvent;
 class VideoWidget;
 class BackgroundWidget;
+class DjDeck;
 class PlaylistWidget;
 class VisualSelector;
 class ControlsWidget;
@@ -95,6 +96,8 @@ public:
     int getControlsVisibilityStatus();
     bool isAdvancedWidgetAvailable();
     bool isPlDocked() { return ( b_plDocked != false ); }
+    bool isDjDeckShown() const;
+    bool hasDjDeck() const;
     bool isInterfaceFullScreen() { return b_interfaceFullScreen; }
     bool isInterfaceAlwaysOnTop() { return b_interfaceOnTop; }
     StandardPLPanel* getPlaylistView();
@@ -153,6 +156,7 @@ protected:
 
     VideoWidget         *videoWidget;
     BackgroundWidget    *bgWidget;
+    DjDeck              *djDeck;
     PlaylistWidget      *playlistWidget;
     //VisualSelector      *visualSelector;
 
@@ -198,6 +202,8 @@ protected:
 
 public slots:
     void dockPlaylist( bool b_docked = true );
+    void toggleDjDeck();
+    void showDjDeck();
     void toggleMinimalView( bool );
     void togglePlaylist();
     void toggleUpdateSystrayMenu(bool requestActivate = false);
@@ -261,6 +267,7 @@ protected slots:
     void hideResumePanel();
     void resumePlayback();
     void onInputChanged( bool );
+    void djAvailability( bool );
     void onVOutChanged( bool );
 
 signals:

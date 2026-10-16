@@ -496,6 +496,13 @@ QMenu *VLCMenuBar::ViewMenu( intf_thread_t *p_intf, QMenu *current, MainInterfac
     action->setChecked( mi->isPlDocked() );
     connect( action, &QAction::triggered, mi, &MainInterface::dockPlaylist );
 
+    /* The DJ's deck, docked where a video goes */
+    action = menu->addAction( qtr( "DJ &Deck" ) );
+    action->setCheckable( true );
+    action->setChecked( mi->isDjDeckShown() );
+    action->setEnabled( mi->hasDjDeck() );
+    connect( action, &QAction::triggered, mi, &MainInterface::toggleDjDeck );
+
     if( mi->getPlaylistView() )
         menu->addMenu( StandardPLPanel::viewSelectionMenu( mi->getPlaylistView() ) );
 

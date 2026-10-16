@@ -95,6 +95,8 @@ libqt_plugin_la_SOURCES = \
 	gui/qt/components/open_panels.cpp gui/qt/components/open_panels.hpp \
 	gui/qt/components/interface_widgets.cpp \
 	gui/qt/components/interface_widgets.hpp \
+	gui/qt/components/dj_deck.cpp \
+	gui/qt/components/dj_deck.hpp \
 	gui/qt/components/controller.cpp gui/qt/components/controller.hpp \
 	gui/qt/components/controller_widget.cpp \
 	gui/qt/components/controller_widget.hpp \
@@ -208,6 +210,7 @@ nodist_libqt_plugin_la_SOURCES = \
 	gui/qt/components/simple_preferences.moc.cpp \
 	gui/qt/components/open_panels.moc.cpp \
 	gui/qt/components/interface_widgets.moc.cpp \
+	gui/qt/components/dj_deck.moc.cpp \
 	gui/qt/components/controller.moc.cpp \
 	gui/qt/components/controller_widget.moc.cpp \
 	gui/qt/components/epg/EPGChannels.moc.cpp \

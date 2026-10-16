@@ -38,6 +38,7 @@
 #include "util/imagehelper.hpp"
 
 #include "components/interface_widgets.hpp"     // bgWidget, videoWidget
+#include "components/dj_deck.hpp"              // djDeck
 #include "components/controller.hpp"            // controllers
 #include "components/playlist/playlist.hpp"     // plWidget
 #include "dialogs/firstrun.hpp"                 // First Run
@@ -98,6 +99,7 @@ MainInterface::MainInterface( intf_thread_t *_p_intf ) : QVLCMW( _p_intf )
 {
     /* Variables initialisation */
     bgWidget             = NULL;
+    djDeck               = NULL;
     videoWidget          = NULL;
     playlistWidget       = NULL;
     stackCentralOldWidget= NULL;
@@ -298,6 +300,9 @@ MainInterface::~MainInterface()
     /* Save the stackCentralW sizes */
     settings->setValue( "bgSize", stackWidgetsSizes[bgWidget] );
     settings->setValue( "playlistSize", stackWidgetsSizes[playlistWidget] );
+    if( isDjDeckShown() && !isFullScreen() )
+        stackWidgetsSizes[djDeck] = stackCentralW->size();
+    settings->setValue( "djSize", stackWidgetsSizes[djDeck] );
     settings->endGroup();
 
     /* Save this size */
@@ -439,6 +444,15 @@ void MainInterface::onInputChanged( bool hasInput )
 {
     if( hasInput == false )
         return;
+    /* the DJ's mix: its deck, where the cone would be */
+    if( hasDjDeck() && stackCentralW->currentWidget() == bgWidget )
+    {
+        input_item_t *item = input_GetItem( THEMIM->getInput() );
+        char *uri = item ? input_item_GetURI( item ) : NULL;
+        if( uri && !strncmp( uri, "djmix:", 6 ) )
+            showTab( djDeck );
+        free( uri );
+    }
     int autoRaise = var_InheritInteger( p_intf, "qt-auto-raise" );
     if ( autoRaise == MainInterface::RAISE_NEVER )
         return;
@@ -495,6 +509,14 @@ void MainInterface::createMainWidget( QSettings *creationSettings )
         videoWidget = new VideoWidget( p_intf, stackCentralW );
         stackCentralW->addWidget( videoWidget );
     }
+    /* The DJ's deck, docked where a video goes */
+    djDeck = new DjDeck( p_intf, stackCentralW );
+    stackCentralW->addWidget( djDeck );
+    stackWidgetsSizes[djDeck] =
+        creationSettings->value( "MainWindow/djSize", djDeck->sizeHint() ).toSize();
+    connect( djDeck, &DjDeck::wanted, this, &MainInterface::showDjDeck );
+    connect( djDeck, &DjDeck::availabilityChanged, this, &MainInterface::djAvailability );
+
     mainLayout->insertWidget( 1, stackCentralW );
 
     stackWidgetsSizes[bgWidget] =
@@ -1070,6 +1092,39 @@ void MainInterface::togglePlaylist()
             dialog->hide();
     }
     debug();
+}
+
+bool MainInterface::isDjDeckShown() const
+{
+    return djDeck && stackCentralW->currentWidget() == djDeck;
+}
+
+bool MainInterface::hasDjDeck() const
+{
+    return djDeck && djDeck->isAvailable();
+}
+
+void MainInterface::toggleDjDeck()
+{
+    if( isDjDeckShown() )
+        showTab( stackCentralOldWidget != djDeck ? stackCentralOldWidget : bgWidget );
+    else if( hasDjDeck() )
+        showTab( djDeck );
+}
+
+/* the DJ asks for its deck: starting, View > DJ, dj.ps1 deck */
+void MainInterface::showDjDeck()
+{
+    if( !hasDjDeck() )
+        return;
+    showTab( djDeck );
+    emit askRaise();
+}
+
+void MainInterface::djAvailability( bool available )
+{
+    if( !available && isDjDeckShown() )
+        showTab( bgWidget );
 }
 
 const Qt::Key MainInterface::kc[10] =
