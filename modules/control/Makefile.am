@@ -68,12 +68,13 @@ control_LTLIBRARIES += libntservice_plugin.la
 control_LTLIBRARIES += libwin_hotkeys_plugin.la libwin_msg_plugin.la
 endif
 
-# the DJ deck: stations, archive.org sets and a voice as JSON routes on VLC's HTTP server
-libdj_plugin_la_SOURCES = control/dj.c \
+# the DJ: a programme, two decks and a mixer that beatmatches, its deck window; JSON routes on
+# VLC's HTTP server
+libdj_plugin_la_SOURCES = control/dj.c control/dj.h control/dj_mix.c control/dj_ui.c \
 	misc/webservices/json.c misc/webservices/json.h misc/webservices/json_helper.h
 libdj_plugin_la_CFLAGS = $(AM_CFLAGS)
 libdj_plugin_la_LIBADD = $(LIBM)
 if HAVE_WIN32_DESKTOP
-libdj_plugin_la_LIBADD += -lole32
+libdj_plugin_la_LIBADD += -lole32 -lgdi32 -luser32
 endif
 control_LTLIBRARIES += libdj_plugin.la
