@@ -70,7 +70,7 @@ endif
 
 # the DJ: a programme, two decks and a mixer that beatmatches, its deck window; JSON routes on
 # VLC's HTTP server
-libdj_plugin_la_SOURCES = control/dj.c control/dj.h control/dj_mix.c control/dj_ui.c \
+libdj_plugin_la_SOURCES = control/dj.c control/dj.h control/dj_host.h control/dj_mix.c control/dj_ui.c \
 	misc/webservices/json.c misc/webservices/json.h misc/webservices/json_helper.h
 libdj_plugin_la_CFLAGS = $(AM_CFLAGS)
 libdj_plugin_la_LIBADD = $(LIBM)
