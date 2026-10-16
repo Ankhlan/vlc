@@ -1732,6 +1732,11 @@ static void retheme( dj_ui_t *ui )
 static void click( dj_ui_t *ui, int id, int arg )
 {
     char e[48 * 3 + 1];
+    mtime_t now = mdate();
+    /* a double click is one press: a request twice would load the second over the first */
+    if( id != B_VOLDN && id != B_VOLUP && id == ui->flash_id && arg == ui->flash_arg
+     && now - ui->flash_at < 7 * CLOCK_FREQ / 10 )
+        return;
     switch( id )
     {
         case B_AIR:    order( ui, "air?on=%d", ui->br.on_air ? 0 : 1 ); break;
@@ -1758,7 +1763,7 @@ static void click( dj_ui_t *ui, int id, int arg )
     }
     ui->flash_id = id;
     ui->flash_arg = arg;
-    ui->flash_at = mdate();
+    ui->flash_at = now;
     ui->mid_dirty = true;
 }
 
