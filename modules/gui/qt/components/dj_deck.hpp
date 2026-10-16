@@ -34,6 +34,8 @@ struct dj_host;
 struct DjNow;
 class DjRecords;
 class DjAvatar;
+class DjTurntable;
+class DjMeter;
 class QLabel;
 class QCheckBox;
 class QComboBox;
@@ -87,7 +89,7 @@ private:
     QTimer                *timer;
     int                    ticks;
 
-    QLabel       *block, *nextBlock, *said, *mixLine, *transition;
+    QLabel       *block, *nextBlock, *said, *mixLine, *transition, *sync;
     QCheckBox    *air;
     QComboBox    *voice;
     DjRecords    *records;
@@ -98,7 +100,9 @@ private:
     {
         QGroupBox *box;
         QLabel    *title, *artist, *source, *detail, *time;
-        QProgressBar *level, *progress;
+        DjTurntable  *turntable;
+        DjMeter      *meter;
+        QProgressBar *progress;
     } side[2];
     QSlider      *xfade;
     QListWidget  *upNext;

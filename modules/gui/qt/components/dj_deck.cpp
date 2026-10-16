@@ -33,7 +33,10 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QDir>
+#include <QFile>
 #include <QIcon>
+#include <QTextStream>
 #include <QPainter>
 #include <QPainterPath>
 #include <QProgressBar>
@@ -82,7 +85,7 @@ public:
     DjRecords( const DjNow *n, QWidget *parent ) : QWidget( parent ), now( n ), host( NULL ), span( 12. )
     {
         shown[0] = shown[1] = 0.;
-        setMinimumHeight( 190 );
+        setMinimumHeight( 150 );
         setSizePolicy( QSizePolicy::Expanding, QSizePolicy::Expanding );
         setToolTip( qtr( "The wheel zooms" ) );
     }
@@ -304,6 +307,201 @@ private:
     QPixmap cone;
 };
 
+/* the beat of the bar nearest the playhead, 0 to 3; -1 without a grid */
+static int bar_beat( const dj_deck_info_t *in, double pos_s )
+{
+    const dj_grid_t *g = &in->grid;
+    if( g->period <= 0. ) return -1;
+    long long k = (long long)floor( (pos_s * DJ_RATE - g->phase) / g->period + .5 );
+    return (int)(((k - g->one) % 4 + 4) % 4);
+}
+
+/* A deck as a turntable: the record turns at 33 1/3 times its tempo while it plays, the arm
+ * walks in with the record, and four lamps count the bar. */
+class DjTurntable : public QWidget
+{
+public:
+    DjTurntable( const DjNow *n, const DjRecords *r, int deck, QWidget *parent )
+        : QWidget( parent ), now( n ), rec( r ), d( deck ), angle( 0. ), arm( -1. )
+    {
+        setFixedSize( 100, 116 );
+    }
+
+    void step( double dt )
+    {
+        const dj_status_t *st = &now->st;
+        const dj_deck_info_t *in = &st->deck[d];
+        bool loaded = now->have && in->state != DJ_EMPTY && in->state != DJ_FAILED;
+        if( loaded && st->attached && !st->paused && in->gain > 0.f )
+            angle = fmod( angle + dt * in->rate * 200., 360. );   /* 33 1/3 rpm: 200 degrees a second */
+        double want = !loaded ? -1. : in->length_s > 0. ? qBound( 0., rec->shown[d] / in->length_s, 1. ) : .3;
+        arm += (want - arm) * qMin( 1., dt * 3. );
+        update();
+    }
+
+protected:
+    void paintEvent( QPaintEvent * ) Q_DECL_OVERRIDE
+    {
+        QPainter p( this );
+        p.setRenderHint( QPainter::Antialiasing );
+        const QPalette &pal = palette();
+        const dj_status_t *st = &now->st;
+        const dj_deck_info_t *in = &st->deck[d];
+        bool loaded = now->have && in->state != DJ_EMPTY && in->state != DJ_FAILED;
+        double side = width(), R = side / 2. - 2.;
+        QPointF c( side / 2., side / 2. );
+        p.setPen( QPen( pal.color( QPalette::Mid ), 1. ) );
+        p.setBrush( pal.color( QPalette::Button ) );
+        p.drawEllipse( c, R, R );
+        p.save();
+        p.translate( c );
+        p.rotate( angle );
+        p.setPen( Qt::NoPen );
+        p.setBrush( pal.color( QPalette::Mid ) );
+        for( int i = 0; i < 48; i++ )   /* the platter's strobe */
+        {
+            p.drawEllipse( QPointF( 0., -(R - 2.5) ), .9, .9 );
+            p.rotate( 7.5 );
+        }
+        if( loaded )
+        {
+            p.setBrush( QColor( 0x18, 0x18, 0x18 ) );
+            p.drawEllipse( QPointF( 0., 0. ), R - 6., R - 6. );
+            p.setBrush( Qt::NoBrush );
+            p.setPen( QPen( QColor( 0x2c, 0x2c, 0x2c ), .6 ) );
+            for( double g = R - 8.; g > R * .38; g -= 2.5 )
+                p.drawEllipse( QPointF( 0., 0. ), g, g );
+            QColor label = st->live == d ? pal.color( QPalette::Highlight ) : QColor( 0x8c, 0x8c, 0x8c );
+            p.setPen( Qt::NoPen );
+            p.setBrush( label );
+            p.drawEllipse( QPointF( 0., 0. ), R * .33, R * .33 );
+            p.setBrush( label.lighter( 135 ) );   /* a stripe on the label, so the turning shows */
+            p.drawPie( QRectF( -R * .33, -R * .33, R * .66, R * .66 ), 60 * 16, 40 * 16 );
+            QFont f = font();
+            f.setBold( true );
+            p.setFont( f );
+            p.setPen( Qt::white );
+            p.drawText( QRectF( -R * .33, -R * .33, R * .66, R * .66 ), Qt::AlignCenter, d ? "B" : "A" );
+            p.setBrush( QColor( 0x10, 0x10, 0x10 ) );
+            p.setPen( Qt::NoPen );
+            p.drawEllipse( QPointF( 0., 0. ), 1.8, 1.8 );
+        }
+        p.restore();
+        if( loaded )   /* the light on the vinyl stays where the lamp is */
+        {
+            QConicalGradient sheen( c, 45. );
+            QColor clear( 255, 255, 255, 0 ), shine( 255, 255, 255, 34 );
+            sheen.setColorAt( 0., clear );
+            sheen.setColorAt( .1, shine );
+            sheen.setColorAt( .2, clear );
+            sheen.setColorAt( .5, clear );
+            sheen.setColorAt( .6, shine );
+            sheen.setColorAt( .7, clear );
+            sheen.setColorAt( 1., clear );
+            p.setPen( Qt::NoPen );
+            p.setBrush( sheen );
+            p.drawEllipse( c, R - 6., R - 6. );
+        }
+        /* the arm: at rest off the record, in the outer groove at the start, by the label at the end */
+        double k = side / 128., a = (arm < 0. ? -4. : 19. + 23. * arm) * M_PI / 180.;
+        QPointF pivot( side - 12. * k, 14. * k ), dir( -sin( a ), cos( a ) );
+        QPointF tip = pivot + dir * (100. * k), back = pivot - dir * (16. * k);
+        p.setPen( QPen( QColor( 0x9a, 0x9a, 0x9a ), 3. * k, Qt::SolidLine, Qt::RoundCap ) );
+        p.drawLine( back, tip );
+        p.setPen( Qt::NoPen );
+        p.setBrush( QColor( 0x60, 0x60, 0x60 ) );
+        p.drawEllipse( back, 5. * k, 5. * k );
+        p.drawEllipse( pivot, 6. * k, 6. * k );
+        p.setBrush( QColor( 0x3a, 0x3a, 0x3a ) );
+        p.drawEllipse( tip, 3.5 * k, 3.5 * k );
+        /* the bar, counted */
+        int beat = loaded ? bar_beat( in, rec->shown[d] ) : -1;
+        for( int i = 0; i < 4; i++ )
+        {
+            QPointF at( side / 2. + (i - 1.5) * 16., height() - 8. );
+            p.setPen( QPen( pal.color( QPalette::Mid ), 1. ) );
+            p.setBrush( i == beat ? (i == 0 ? pal.color( QPalette::Highlight ) : pal.color( QPalette::Highlight ).lighter( 140 ))
+                                  : pal.color( QPalette::Base ) );
+            p.drawEllipse( at, i == 0 ? 4.5 : 3.5, i == 0 ? 4.5 : 3.5 );
+        }
+    }
+
+private:
+    const DjNow *now;
+    const DjRecords *rec;
+    int d;
+    double angle, arm;
+};
+
+/* a channel's level, as VLC's volume shows it, green to red, the peak held a moment */
+class DjMeter : public QWidget
+{
+public:
+    DjMeter( QWidget *parent ) : QWidget( parent ), db( -120.f ), peak( -120.f ), peak_at( 0 )
+    {
+        setFixedWidth( 10 );
+        setMinimumHeight( 60 );
+    }
+    void feed( float v, mtime_t t )
+    {
+        if( !(v > -120.f) ) v = -120.f;
+        db = v;
+        if( v >= peak || t - peak_at > 3 * CLOCK_FREQ / 2 )
+        {
+            peak = v;
+            peak_at = t;
+        }
+        update();
+    }
+
+protected:
+    void paintEvent( QPaintEvent * ) Q_DECL_OVERRIDE
+    {
+        QPainter p( this );
+        QRectF r = QRectF( rect() ).adjusted( .5, .5, -.5, -.5 );
+        p.setPen( palette().color( QPalette::Mid ) );
+        p.setBrush( palette().color( QPalette::Base ) );
+        p.drawRect( r );
+        double f = qBound( 0., (db + 48.) / 48., 1. ), pk = qBound( 0., (peak + 48.) / 48., 1. );
+        QLinearGradient g( 0., r.bottom(), 0., r.top() );
+        g.setColorAt( 0., QColor( 0x3c, 0xb4, 0x3c ) );
+        g.setColorAt( .72, QColor( 0xe0, 0xc4, 0x1e ) );
+        g.setColorAt( 1., QColor( 0xd8, 0x34, 0x22 ) );
+        QRectF in = r.adjusted( 1.5, 1.5, -1.5, -1.5 );
+        p.fillRect( QRectF( in.left(), in.bottom() - in.height() * f, in.width(), in.height() * f ), g );
+        if( pk > 0. )
+            p.fillRect( QRectF( in.left(), in.bottom() - in.height() * pk, in.width(), 1.5 ), palette().color( QPalette::Text ) );
+    }
+
+private:
+    float db, peak;
+    mtime_t peak_at;
+};
+
+/* who runs the requests: the Claude agent dj, its model and effort, from its own definition */
+static QString runner()
+{
+    QFile f( QDir::homePath() + "/.claude/agents/dj.md" );
+    QString model, effort;
+    if( f.open( QIODevice::ReadOnly | QIODevice::Text ) )
+    {
+        QTextStream in( &f );
+        for( int fences = 0; !in.atEnd() && fences < 2; )
+        {
+            QString l = in.readLine().trimmed();
+            if( l == "---" ) fences++;
+            else if( l.startsWith( "model:" ) ) model = l.mid( 6 ).trimmed();
+            else if( l.startsWith( "effort:" ) ) effort = l.mid( 7 ).trimmed();
+        }
+    }
+    if( model.isEmpty() ) return QString();
+    static const char *const names[][2] = { { "haiku", "Claude Haiku 5.5" }, { "sonnet", "Claude Sonnet 5.5" },
+                                            { "opus", "Claude Opus 5.5" }, { "fable", "Claude Fable 5.1" } };
+    for( size_t i = 0; i < sizeof names / sizeof *names; i++ )
+        if( model == names[i][0] ) model = names[i][1];
+    return qtr( "%1, effort %2" ).arg( model, effort.isEmpty() ? qtr( "default" ) : effort );
+}
+
 DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
     : QWidget( parent ), p_intf( _p_intf ), host( NULL ), now( new DjNow ), ticks( 0 )
 {
@@ -332,6 +530,22 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
     QFont italic = said->font();
     italic.setItalic( true );
     said->setFont( italic );
+    QLabel *name = new QLabel( qtr( "DJ" ) ), *card = new QLabel;
+    QFont big = bold;
+    big.setPointSizeF( big.pointSizeF() * 1.25 );
+    name->setFont( big );
+    QString run = runner();
+    card->setText( run.isEmpty() ? qtr( "the dj module" ) : run );
+    quiet( card );
+    QString about = qtr( "The DJ in VLC is the dj module: it keeps the programme, picks the records and mixes them." );
+    if( !run.isEmpty() ) about += " " + qtr( "Requests from Claude go through the dj agent: %1." ).arg( run );
+    avatar->setToolTip( about );
+    card->setToolTip( about );
+    QHBoxLayout *ident = new QHBoxLayout;
+    ident->addWidget( name );
+    ident->addSpacing( 8 );
+    ident->addWidget( card );
+    ident->addStretch();
     QHBoxLayout *when = new QHBoxLayout;
     when->addWidget( block );
     when->addSpacing( 12 );
@@ -339,6 +553,7 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
     when->addStretch();
     QVBoxLayout *who = new QVBoxLayout;
     who->addStretch();
+    who->addLayout( ident );
     who->addLayout( when );
     who->addWidget( said );
     who->addStretch();
@@ -358,7 +573,12 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
     {
         Side &s = side[d];
         s.box = new QGroupBox( d ? qtr( "Deck B" ) : qtr( "Deck A" ) );
-        QVBoxLayout *v = new QVBoxLayout( s.box );
+        QHBoxLayout *hv = new QHBoxLayout( s.box );
+        s.turntable = new DjTurntable( now, records, d, s.box );
+        QVBoxLayout *v = new QVBoxLayout;
+        if( d == 0 ) hv->addWidget( s.turntable );
+        hv->addLayout( v, 1 );
+        if( d == 1 ) hv->addWidget( s.turntable );
         s.title = new QLabel;
         s.title->setFont( bold );
         s.artist = new QLabel;
@@ -384,12 +604,10 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
         s.progress->setTextVisible( false );
         s.progress->setMaximumHeight( 4 );
         v->addWidget( s.progress );
-        s.level = new QProgressBar;
-        s.level->setRange( 0, 600 );
-        s.level->setTextVisible( false );
-        s.level->setMaximumHeight( 6 );
+        s.meter = new DjMeter( this );
     }
-    QVBoxLayout *m = new QVBoxLayout( mix );
+    QHBoxLayout *mh = new QHBoxLayout( mix );
+    QVBoxLayout *m = new QVBoxLayout;
     transition = new QLabel;
     transition->setAlignment( Qt::AlignCenter );
     transition->setSizePolicy( QSizePolicy::Ignored, QSizePolicy::Preferred );
@@ -397,12 +615,13 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
     xfade->setRange( -100, 100 );
     xfade->setEnabled( false );   /* the DJ's hand on it, not ours */
     xfade->setToolTip( qtr( "The crossfader: deck A to the left, deck B to the right" ) );
-    QHBoxLayout *levels = new QHBoxLayout;
-    levels->addWidget( new QLabel( "A" ) );
-    levels->addWidget( side[0].level );
-    levels->addSpacing( 8 );
-    levels->addWidget( side[1].level );
-    levels->addWidget( new QLabel( "B" ) );
+    sync = new QLabel;   /* how close the beats are in a blend */
+    sync->setAlignment( Qt::AlignCenter );
+    quiet( sync );
+    QHBoxLayout *ab = new QHBoxLayout;
+    ab->addWidget( new QLabel( "A" ) );
+    ab->addStretch();
+    ab->addWidget( new QLabel( "B" ) );
     transition->setFont( bold );
     mixProgress = new QProgressBar;
     mixProgress->setRange( 0, 100 );
@@ -411,9 +630,13 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
     mixProgress->hide();
     m->addWidget( transition );
     m->addWidget( mixProgress );
+    m->addWidget( sync );
     m->addStretch();
     m->addWidget( xfade );
-    m->addLayout( levels );
+    m->addLayout( ab );
+    mh->addWidget( side[0].meter );
+    mh->addLayout( m, 1 );
+    mh->addWidget( side[1].meter );
     decks->addWidget( side[0].box, 2 );
     decks->addWidget( mix, 1 );
     decks->addWidget( side[1].box, 2 );
@@ -547,15 +770,16 @@ void DjDeck::tick()
     now->have = host->status( &now->st, &now->br );
     if( !now->have ) return;
     mtime_t t = mdate();
-    records->follow( now->at ? (t - now->at) / (double)CLOCK_FREQ : 0. );
+    double dt = now->at ? (t - now->at) / (double)CLOCK_FREQ : 0.;
+    records->follow( dt );
     now->at = t;
     records->update();
     const dj_status_t *st = &now->st;
     for( int d = 0; d < 2; d++ )
     {
         const dj_deck_info_t *in = &st->deck[d];
-        bool heard = in->state != DJ_EMPTY && in->gain > 0.f && in->level_db > -60.f;
-        side[d].level->setValue( heard ? (int)((in->level_db + 60.f) * 10.f) : 0 );
+        side[d].meter->feed( in->state != DJ_EMPTY && in->gain > 0.f ? in->level_db : -120.f, t );
+        side[d].turntable->step( dt );
     }
     xfade->setValue( (int)lroundf( st->xfade * 100.f ) );
     for( int d = 0; d < 2; d++ )
@@ -653,6 +877,21 @@ void DjDeck::words()
     else if( st->live >= 0 )
         t = qtr( "Playing it through" );
     transition->setText( t );
+    QString sy;
+    int a = st->from, b = st->to;
+    if( st->running && a >= 0 && b >= 0 && a < DJ_DECKS && b < DJ_DECKS
+     && st->deck[a].grid.period > 0. && st->deck[b].grid.period > 0. )
+    {
+        const dj_deck_info_t *x = &st->deck[a], *y = &st->deck[b];
+        double fx = (x->pos_s * DJ_RATE - x->grid.phase) / x->grid.period;
+        double fy = (y->pos_s * DJ_RATE - y->grid.phase) / y->grid.period;
+        double f = (fx - floor( fx )) - (fy - floor( fy ));
+        f -= floor( f + .5 );
+        sy = qtr( "Beats matched to %1 ms" ).arg( fabs( f * x->grid.period / DJ_RATE * 1000. / (x->rate > 0. ? x->rate : 1.) ), 0, 'f', 1 );
+    }
+    else if( st->live >= 0 && st->live < DJ_DECKS && st->deck[st->live].grid.period > 0. )
+        sy = QString( "%1 BPM" ).arg( st->deck[st->live].grid.bpm * st->deck[st->live].rate, 0, 'f', 1 );
+    sync->setText( sy );
     transition->setToolTip( qfu( st->note ) );
 
     QStringList l;
