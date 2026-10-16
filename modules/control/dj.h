@@ -30,6 +30,7 @@
 typedef struct
 {
     char   *url, *title, *artist, *label;
+    char   *art;          /* its cover: a URL, a cached file once it is cued */
     int64_t length_ms;    /* 0: unknown */
     bool    endless;      /* a station */
     bool    requested;
@@ -65,6 +66,7 @@ typedef struct
     bool       eof;
     double     rate;              /* 1: the record's own speed */
     float      gain, trim_db, low_db, level_db;
+    float      hand_low_db;       /* the listener's bass turn on it */
     float      loud;              /* LUFS of what was analysed */
     dj_grid_t  grid;
     char       codec[8];
@@ -83,6 +85,9 @@ typedef struct
     double  progress;             /* 0..1 once running */
     double  starts_in_s;          /* until it begins, armed */
     float   xfade;                /* -1 all deck A .. +1 all deck B */
+    bool    hand;                 /* the listener has the fader, at hand_x, until the next transition */
+    float   hand_x;
+    double  rec_s;                /* the set recorded so far, seconds; -1 not recording */
     int     from, to;             /* the decks it takes out and brings in, or -1 */
     double  at_s, span_s;         /* where it begins on the outgoing record, and how long, its seconds */
     bool    attached, paused;
@@ -106,6 +111,10 @@ void dj_mix_StatusClean( dj_status_t * );
 /* the record from from_s to to_s, its own seconds, in n columns of amplitude: kick band and
    K-weighted; -1 where nothing is read yet or no longer kept */
 void dj_mix_Wave( dj_mix_t *, int deck, double from_s, double to_s, int n, float *low, float *full );
+void dj_mix_Fader( dj_mix_t *, float x );
+int64_t dj_mix_Record( dj_mix_t *, const char *wav_path );
+void dj_mix_Bass( dj_mix_t *, int deck, float db );
+void dj_mix_Bands( dj_mix_t *, int deck, double from_s, double to_s, int n, float *mid, float *high );
 
 int  DjMixOpen( vlc_object_t * );     /* access_demux djmix:// */
 void DjMixClose( vlc_object_t * );

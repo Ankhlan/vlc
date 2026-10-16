@@ -50,6 +50,7 @@
 #include <vlc_sout.h>
 #include <vlc_block.h>
 #include <vlc_es.h>
+#include <vlc_fs.h>
 
 #include <math.h>
 
@@ -144,17 +145,18 @@ typedef struct
     float          *buf;                   /* stereo frames */
     int64_t         cap, written, floor;   /* the writer may overwrite frames before floor */
     float          *env_low, *env_k, *env_peak;   /* a value a hop: kick band, K-weighted, peak */
+    float          *env_mid, *env_hi;      /* and the mids and highs, for the eye */
     int64_t         hop_cap, hops;
-    float          *ov;                    /* the whole record: kick band, K-weighted pairs */
+    float          *ov;                    /* the whole record: kick band, K-weighted, mids, highs */
     int64_t         ov_cap, ov_n;
     bool            dead, failed, stopping;
     /* the writer's own */
-    bq_t            lp[2], kw[4];
-    double          acc_low, acc_k;
+    bq_t            lp[2], kw[4], bm[2], bh[2];
+    double          acc_low, acc_k, acc_mid, acc_hi;
     float           acc_peak;
     int             acc_n;
     int64_t         hops_w, ov_w;
-    float           ov_l, ov_k;
+    float           ov_l, ov_k, ov_m, ov_h;
     int             ov_acc;
 
     /* the mixer's, m->lock */
@@ -189,6 +191,20 @@ typedef struct
     int64_t t0;
 } trans_t;
 
+/* the set on disk: the mixer hands over what the room hears, a thread writes it, 24 bits */
+typedef struct
+{
+    vlc_thread_t thread;
+    vlc_mutex_t  lock;
+    vlc_cond_t   cond;
+    float       *ring;
+    int64_t      cap, r, w;          /* frames; r and w only grow */
+    int64_t      written;
+    FILE        *f;
+    bool         quit;
+    unsigned     dropped;
+} rec_t;
+
 struct dj_mix
 {
     vlc_object_t *owner;
@@ -202,11 +218,16 @@ struct dj_mix
     dj_track_t    pending;
     bool          has_pending;
     trans_t       tr;
+    /* the listener's hand: the fader stays where it was left until the DJ's next transition
+       takes it back; a deck's bass stays turned for the record */
+    float         hand_x, hand_w, hand_low[DJ_DECKS];
+    bool          hand_held;
     int64_t       time;                    /* frames mixed */
     float         master, master_target;
     float         lim_gain, lim_buf[2 * LIM_LA], lim_need[LIM_LA];
     int           lim_w, lim_hot;
     float         out_level;
+    rec_t        *rec;                     /* while the set is recorded */
     demux_t      *out;
     bool          paused;
     unsigned      events;
@@ -225,6 +246,7 @@ void dj_track_Copy( dj_track_t *dst, const dj_track_t *src )
     dst->title = src->title ? strdup( src->title ) : NULL;
     dst->artist = src->artist ? strdup( src->artist ) : NULL;
     dst->label = src->label ? strdup( src->label ) : NULL;
+    dst->art = src->art ? strdup( src->art ) : NULL;
     dst->length_ms = src->length_ms;
     dst->endless = src->endless;
     dst->requested = src->requested;
@@ -234,7 +256,7 @@ void dj_track_Copy( dj_track_t *dst, const dj_track_t *src )
 
 void dj_track_Clean( dj_track_t *t )
 {
-    free( t->url ); free( t->title ); free( t->artist ); free( t->label );
+    free( t->url ); free( t->title ); free( t->artist ); free( t->label ); free( t->art );
     memset( t, 0, sizeof *t );
 }
 
@@ -261,17 +283,19 @@ static void ov_push( deck_t *d )
         int64_t cap = d->ov_cap ? 2 * d->ov_cap : 4096;
         if( cap > OV_MAX ) cap = OV_MAX;
         vlc_mutex_lock( &d->lock );
-        float *ov = realloc( d->ov, cap * 2 * sizeof (float) );
+        float *ov = realloc( d->ov, cap * 4 * sizeof (float) );
         if( ov ) { d->ov = ov; d->ov_cap = cap; }
         vlc_mutex_unlock( &d->lock );
     }
     if( d->ov_w < d->ov_cap )
     {
-        d->ov[2 * d->ov_w] = sqrtf( d->ov_l / OV_HOPS );
-        d->ov[2 * d->ov_w + 1] = sqrtf( d->ov_k / OV_HOPS );
+        d->ov[4 * d->ov_w] = sqrtf( d->ov_l / OV_HOPS );
+        d->ov[4 * d->ov_w + 1] = sqrtf( d->ov_k / OV_HOPS );
+        d->ov[4 * d->ov_w + 2] = sqrtf( d->ov_m / OV_HOPS );
+        d->ov[4 * d->ov_w + 3] = sqrtf( d->ov_h / OV_HOPS );
         d->ov_w++;
     }
-    d->ov_l = d->ov_k = 0.f;
+    d->ov_l = d->ov_k = d->ov_m = d->ov_h = 0.f;
     d->ov_acc = 0;
 }
 
@@ -284,6 +308,10 @@ static void deck_analyse( deck_t *d, const float *p, size_t n )
         double kl = bq_run( &d->kw[1], bq_run( &d->kw[0], l ) );
         double kr = bq_run( &d->kw[3], bq_run( &d->kw[2], r ) );
         d->acc_low += y * y;
+        double c = 0.5 * (l + r);
+        double mm = bq_run( &d->bm[1], bq_run( &d->bm[0], c ) ), hh = bq_run( &d->bh[1], bq_run( &d->bh[0], c ) );
+        d->acc_mid += mm * mm;
+        d->acc_hi += hh * hh;
         d->acc_k += kl * kl + kr * kr;
         float a = fabsf( p[2 * i] ), b = fabsf( p[2 * i + 1] );
         if( a > d->acc_peak ) d->acc_peak = a;
@@ -294,11 +322,15 @@ static void deck_analyse( deck_t *d, const float *p, size_t n )
             d->env_low[h] = (float)(d->acc_low / DJ_HOP);
             d->env_k[h] = (float)(d->acc_k / DJ_HOP);
             d->env_peak[h] = d->acc_peak;
+            d->env_mid[h] = (float)(d->acc_mid / DJ_HOP);
+            d->env_hi[h] = (float)(d->acc_hi / DJ_HOP);
             d->ov_l += d->env_low[h];
             d->ov_k += d->env_k[h];
+            d->ov_m += d->env_mid[h];
+            d->ov_h += d->env_hi[h];
             if( ++d->ov_acc == OV_HOPS ) ov_push( d );
             d->hops_w++;
-            d->acc_low = d->acc_k = 0.;
+            d->acc_low = d->acc_k = d->acc_mid = d->acc_hi = 0.;
             d->acc_peak = 0.f;
             d->acc_n = 0;
         }
@@ -430,10 +462,11 @@ static void deck_free_buffers( deck_t *d )
 {
     vlc_mutex_lock( &d->lock );
     float *b = d->buf, *l = d->env_low, *k = d->env_k, *p = d->env_peak, *o = d->ov;
-    d->buf = d->env_low = d->env_k = d->env_peak = d->ov = NULL;
+    float *em = d->env_mid, *eh = d->env_hi;
+    d->buf = d->env_low = d->env_k = d->env_peak = d->ov = d->env_mid = d->env_hi = NULL;
     d->ov_cap = d->ov_n = 0;
     vlc_mutex_unlock( &d->lock );
-    free( b ); free( l ); free( k ); free( p ); free( o );
+    free( b ); free( l ); free( k ); free( p ); free( o ); free( em ); free( eh );
     free( d->echo );
     d->echo = NULL;
 }
@@ -471,31 +504,37 @@ static bool deck_load( dj_mix_t *m, deck_t *d, dj_track_t *t )
     float *buf = malloc( cap * 2 * sizeof (float) );
     float *el = malloc( hop_cap * sizeof (float) ), *ek = malloc( hop_cap * sizeof (float) );
     float *ep = malloc( hop_cap * sizeof (float) );
+    float *em = malloc( hop_cap * sizeof (float) ), *eh = malloc( hop_cap * sizeof (float) );
     d->echo = calloc( 2 * ECHO_MAX, sizeof (float) );
-    if( buf == NULL || el == NULL || ek == NULL || ep == NULL || d->echo == NULL )
+    if( buf == NULL || el == NULL || ek == NULL || ep == NULL || em == NULL || eh == NULL || d->echo == NULL )
     {
-        free( buf ); free( el ); free( ek ); free( ep );
+        free( buf ); free( el ); free( ek ); free( ep ); free( em ); free( eh );
         free( d->echo );
         d->echo = NULL;
         dj_track_Clean( t );
         return false;
     }
     vlc_mutex_lock( &d->lock );
-    d->buf = buf; d->env_low = el; d->env_k = ek; d->env_peak = ep;
+    d->buf = buf; d->env_low = el; d->env_k = ek; d->env_peak = ep; d->env_mid = em; d->env_hi = eh;
     d->cap = cap; d->hop_cap = hop_cap;
     d->written = d->floor = d->hops = 0;
     d->dead = d->failed = d->stopping = false;
     vlc_mutex_unlock( &d->lock );
     d->hops_w = d->ov_w = 0;
     d->regrid_at = 0;
-    d->ov_l = d->ov_k = 0.f;
+    d->ov_l = d->ov_k = d->ov_m = d->ov_h = 0.f;
     d->ov_acc = 0;
+    bq_highpass( &d->bm[0], 200., M_SQRT1_2 );
+    bq_lowpass( &d->bm[1], 2500., M_SQRT1_2 );
+    bq_highpass( &d->bh[0], 2500., M_SQRT1_2 );
+    d->bh[1] = d->bh[0];
+    for( int i = 0; i < 2; i++ ) { bq_clear( &d->bm[i] ); bq_clear( &d->bh[i] ); }
     bq_lowpass( &d->lp[0], 150., M_SQRT1_2 );
     bq_clear( &d->lp[0] );
     d->lp[1] = d->lp[0];
     bq_kweight( &d->kw[0], &d->kw[1] );
     bq_kweight( &d->kw[2], &d->kw[3] );
-    d->acc_low = d->acc_k = 0.;
+    d->acc_low = d->acc_k = d->acc_mid = d->acc_hi = 0.;
     d->acc_peak = 0.f;
     d->acc_n = 0;
 
@@ -503,6 +542,7 @@ static bool deck_load( dj_mix_t *m, deck_t *d, dj_track_t *t )
     d->resample = d->audible = d->underrun = d->shelf_on = d->echo_on = false;
     d->start_at = 0;
     d->gain = 0.f; d->trim = d->trim_target = 1.f; d->low_db = 0.f; d->level = 0.f; d->shelf_db = 0.f;
+    m->hand_low[d->id] = 0.f;
     d->echo_w = 0; d->echo_len = 1; d->echo_send = 0.f; d->dry = 1.f;
     d->starved_since = 0;
     memset( &d->grid, 0, sizeof d->grid );
@@ -750,6 +790,8 @@ static bool beat_track( const float *low, const float *kw, int64_t n0, int which
 
     onset( low, n, s, o );
     onset( kw, n, s, ko );
+    bool swung = false;
+again:;
     double mean = 0., omean = 0.;
     for( int64_t i = 0; i < n; i++ ) omean += o[i];
     omean /= n;
@@ -834,6 +876,18 @@ static bool beat_track( const float *low, const float *kw, int64_t n0, int which
         }
     }
 
+    /* above 180 it is the eighths: rock's kicks and bass land on them often enough to pass for beats */
+    if( 60000. / P > 180. )
+    {
+        P *= 2.;
+        for( int pass = 1; pass < 3; pass++ )
+        {
+            hits = beat_pass( o, n, lims[pass], 1.5 * omean, P / (pass == 1 ? 12. : 16.), &P, &phi, &jit, &sd,
+                              &beats, bk, bt, bw, res );
+            if( hits == 0 ) goto out;
+        }
+    }
+
     /* claps and snares sit on 2 and 4: the parity with less of them starts the half bars */
     double ev = 0., od = 0.;
     int ne = 0, no = 0;
@@ -874,8 +928,23 @@ static bool beat_track( const float *low, const float *kw, int64_t n0, int which
     g->drift = 64. * sd;
     g->kick_from = (double)r0;
     g->kick_to = (double)r1;
-    ok = g->conf >= 0.6f && hits >= 16 && g->jitter <= 12.f && g->drift <= 8.
-      && g->bpm >= 70. && g->bpm <= 200.;
+    ok = swung ? g->conf >= 0.45f && hits >= 16 && g->jitter <= 18.f && g->drift <= 12.
+               : g->conf >= 0.6f && hits >= 16 && g->jitter <= 12.f && g->drift <= 8.;
+    ok = ok && g->bpm >= 70. && g->bpm <= 200.;
+    /* swung: a boom bap's kick skips beats and lands off them, the snare on 2 and 4 keeps
+       the time. Once more, on the kicks and the snares together, with the swing allowed */
+    if( !ok && !swung && g->bpm >= 70. && g->bpm <= 120. )
+    {
+        double sl = 0., sk = 0.;
+        for( int64_t i = 0; i < n; i++ ) { sl += o[i]; sk += ko[i]; }
+        if( sk > 0. )
+        {
+            for( int64_t i = 0; i < n; i++ ) o[i] += ko[i] * (float)(sl / sk);
+            swung = true;
+            memset( g, 0, sizeof *g );
+            goto again;
+        }
+    }
 out:
     free( o ); free( ko ); free( s ); free( o4 ); free( acf );
     free( bk ); free( bt ); free( bw ); free( res );
@@ -1332,6 +1401,14 @@ static void deck_render( dj_mix_t *m, deck_t *d, float *acc, int n )
         }
         float g1, low1, send1, dry1;
         automate( m, d, m->time + i + sub, &g1, &low1, &send1, &dry1 );
+        if( m->hand_w > 0.f )   /* a club fader: both full in the middle, each cut at its end */
+        {
+            float x = d->id == 0 ? m->hand_x : -m->hand_x;
+            float gh = x <= 0.f ? 1.f : cosf( x * (float)M_PI / 2.f );
+            g1 *= 1.f + (gh - 1.f) * m->hand_w;
+        }
+        low1 += m->hand_low[d->id];
+        if( low1 < -30.f ) low1 = -30.f;
         if( d->trim != d->trim_target )   /* remeasured: to its new level at 2 dB a second */
         {
             float k = powf( 10.f, .1f * sub / DJ_RATE );
@@ -1431,6 +1508,7 @@ static void trans_begin( dj_mix_t *m )
     b->low_db = 0.f;
     b->shelf_on = false;
     b->echo_on = false;
+    m->hand_held = false;   /* the DJ takes the fader back */
     b->start_at = m->time + (tr->kind == DJ_ECHO ? (int64_t)llround( tr->beat ) : 0);
     b->audible = true;
     b->state = DJ_LIVE;
@@ -1532,6 +1610,9 @@ static void mix_run( dj_mix_t *m, float *out, int n )
             if( k == 0 ) trans_begin( m );
             else if( k < seg ) seg = k;
         }
+        /* the hand takes the fader in a tenth of a second and gives it back over two */
+        float hw = m->hand_held ? fminf( 1.f, m->hand_w + seg / (.1f * DJ_RATE) ) : fmaxf( 0.f, m->hand_w - seg / (2.f * DJ_RATE) );
+        m->hand_w = hw;
         for( int i = 0; i < DJ_DECKS; i++ )
             if( m->deck[i].audible ) deck_render( m, &m->deck[i], out + 2 * done, seg );
         m->time += seg;
@@ -1553,6 +1634,117 @@ static void mix_run( dj_mix_t *m, float *out, int n )
     float peak = 0.f;
     for( int i = 0; i < 2 * n; i++ ) peak = fmaxf( peak, fabsf( out[i] ) );
     m->out_level = fmaxf( m->out_level * 0.9f, peak );
+    rec_t *rc = m->rec;
+    if( rc )   /* never waits: a full ring drops, and counts it */
+    {
+        vlc_mutex_lock( &rc->lock );
+        int64_t room = rc->cap - (rc->w - rc->r), k = n < room ? n : room;
+        for( int64_t i = 0; i < k; i++ )
+        {
+            int64_t at = (rc->w + i) % rc->cap;
+            rc->ring[2 * at] = out[2 * i];
+            rc->ring[2 * at + 1] = out[2 * i + 1];
+        }
+        rc->w += k;
+        if( k < n ) rc->dropped += (unsigned)(n - k);
+        vlc_cond_signal( &rc->cond );
+        vlc_mutex_unlock( &rc->lock );
+    }
+}
+
+static void wav_header( FILE *f, int64_t frames )
+{
+    uint32_t data = (uint32_t)(frames * 6), rate = DJ_RATE;
+    uint8_t h[44];
+    memcpy( h, "RIFF", 4 ); SetDWLE( h + 4, 36 + data ); memcpy( h + 8, "WAVEfmt ", 8 );
+    SetDWLE( h + 16, 16 ); SetWLE( h + 20, 1 ); SetWLE( h + 22, 2 ); SetDWLE( h + 24, rate );
+    SetDWLE( h + 28, rate * 6 ); SetWLE( h + 32, 6 ); SetWLE( h + 34, 24 );
+    memcpy( h + 36, "data", 4 ); SetDWLE( h + 40, data );
+    fseek( f, 0, SEEK_SET );
+    fwrite( h, 1, sizeof h, f );
+}
+
+static void *RecThread( void *data )
+{
+    rec_t *rc = data;
+    uint8_t buf[4096 * 6];
+    vlc_mutex_lock( &rc->lock );
+    for( ;; )
+    {
+        while( rc->r == rc->w && !rc->quit ) vlc_cond_wait( &rc->cond, &rc->lock );
+        if( rc->r == rc->w ) break;
+        int64_t k = rc->w - rc->r;
+        if( k > 4096 ) k = 4096;
+        for( int64_t i = 0; i < k; i++ )
+        {
+            int64_t at = (rc->r + i) % rc->cap;
+            for( int c = 0; c < 2; c++ )
+            {
+                float v = rc->ring[2 * at + c];
+                v = v > 1.f ? 1.f : v < -1.f ? -1.f : v;
+                int32_t q = (int32_t)lrintf( v * 8388607.f );
+                buf[6 * i + 3 * c] = q & 0xff;
+                buf[6 * i + 3 * c + 1] = (q >> 8) & 0xff;
+                buf[6 * i + 3 * c + 2] = (q >> 16) & 0xff;
+            }
+        }
+        vlc_mutex_unlock( &rc->lock );
+        size_t put = fwrite( buf, 6, (size_t)k, rc->f );
+        vlc_mutex_lock( &rc->lock );
+        rc->r += k;
+        rc->written += (int64_t)put;
+    }
+    vlc_mutex_unlock( &rc->lock );
+    return NULL;
+}
+
+/* the set into a WAV file from now; path NULL stops it. Answers the frames written, or -1 */
+int64_t dj_mix_Record( dj_mix_t *m, const char *path )
+{
+    vlc_mutex_lock( &m->lock );
+    rec_t *rc = m->rec;
+    m->rec = NULL;
+    vlc_mutex_unlock( &m->lock );
+    int64_t frames = -1;
+    if( rc )
+    {
+        vlc_mutex_lock( &rc->lock );
+        rc->quit = true;
+        vlc_cond_signal( &rc->cond );
+        vlc_mutex_unlock( &rc->lock );
+        vlc_join( rc->thread, NULL );
+        frames = rc->written;
+        wav_header( rc->f, frames );
+        fclose( rc->f );
+        if( rc->dropped && m->log ) say( m, "record", "%u frames lost: the disk fell behind", rc->dropped );
+        vlc_cond_destroy( &rc->cond );
+        vlc_mutex_destroy( &rc->lock );
+        free( rc->ring );
+        free( rc );
+    }
+    if( path == NULL ) return frames;
+    rc = calloc( 1, sizeof *rc );
+    if( rc == NULL ) return -1;
+    rc->cap = 20 * DJ_RATE;
+    rc->ring = malloc( rc->cap * 2 * sizeof (float) );
+    rc->f = rc->ring ? vlc_fopen( path, "wb" ) : NULL;
+    if( rc->f == NULL ) { free( rc->ring ); free( rc ); return -1; }
+    wav_header( rc->f, 0 );
+    vlc_mutex_init( &rc->lock );
+    vlc_cond_init( &rc->cond );
+    if( vlc_clone( &rc->thread, RecThread, rc, VLC_THREAD_PRIORITY_LOW ) )
+    {
+        fclose( rc->f );
+        vlc_cond_destroy( &rc->cond );
+        vlc_mutex_destroy( &rc->lock );
+        free( rc->ring );
+        free( rc );
+        return -1;
+    }
+    vlc_mutex_lock( &m->lock );
+    m->rec = rc;
+    vlc_mutex_unlock( &m->lock );
+    return 0;
 }
 
 /*****************************************************************************
@@ -2114,6 +2306,7 @@ void dj_mix_Delete( dj_mix_t *m )
     vlc_cond_signal( &m->wake );
     vlc_mutex_unlock( &m->lock );
     if( m->started ) vlc_join( m->thread, NULL );
+    dj_mix_Record( m, NULL );   /* a set recorded to the end stays a whole WAV */
     vlc_mutex_lock( &m->lock );
     for( int i = 0; i < DJ_DECKS; i++ )
     {
@@ -2145,6 +2338,28 @@ void dj_mix_Next( dj_mix_t *m, int urgency )
     if( urgency > m->want ) m->want = urgency;
     if( m->tr.armed && !m->tr.running && urgency > m->tr.urgency ) m->tr.armed = false;
     vlc_cond_signal( &m->wake );
+    vlc_mutex_unlock( &m->lock );
+}
+
+/* the listener on the fader: -1 deck A .. +1 deck B; NAN gives it back to the DJ now */
+void dj_mix_Fader( dj_mix_t *m, float x )
+{
+    vlc_mutex_lock( &m->lock );
+    if( x != x ) m->hand_held = false;
+    else
+    {
+        m->hand_x = x < -1.f ? -1.f : x > 1.f ? 1.f : x;
+        m->hand_held = true;
+    }
+    vlc_mutex_unlock( &m->lock );
+}
+
+/* the listener on a deck's bass, in dB: -26 kills it, 0 is flat, +6 at most */
+void dj_mix_Bass( dj_mix_t *m, int deck, float db )
+{
+    if( deck < 0 || deck >= DJ_DECKS || db != db ) return;
+    vlc_mutex_lock( &m->lock );
+    m->hand_low[deck] = db < -26.f ? -26.f : db > 6.f ? 6.f : db;
     vlc_mutex_unlock( &m->lock );
 }
 
@@ -2260,6 +2475,16 @@ void dj_mix_Status( dj_mix_t *m, dj_status_t *s )
     }
     float ga = m->deck[0].audible ? m->deck[0].gain : 0.f, gb = m->deck[1].audible ? m->deck[1].gain : 0.f;
     s->xfade = ga + gb > 1e-6f ? (gb - ga) / (ga + gb) : 0.f;
+    s->hand = m->hand_held;
+    if( m->rec )
+    {
+        vlc_mutex_lock( &m->rec->lock );
+        s->rec_s = (double)m->rec->w / DJ_RATE;
+        vlc_mutex_unlock( &m->rec->lock );
+    }
+    else s->rec_s = -1.;
+    s->hand_x = m->hand_x;
+    for( int i = 0; i < DJ_DECKS; i++ ) s->deck[i].hand_low_db = m->hand_low[i];
     s->attached = m->out != NULL;
     s->paused = m->paused;
     s->master_db = db_of( m->master );
@@ -2281,6 +2506,57 @@ void dj_mix_StatusClean( dj_status_t *s )
     }
 }
 
+/* the mids and highs as dj_mix_Wave gives the bass: what the eye needs for the drop, the
+ * breakdown and the hats */
+void dj_mix_Bands( dj_mix_t *m, int di, double from_s, double to_s, int n, float *mid, float *high )
+{
+    for( int c = 0; c < n; c++ ) mid[c] = high[c] = -1.f;
+    if( di < 0 || di >= DJ_DECKS || n <= 0 || to_s <= from_s ) return;
+    deck_t *d = &m->deck[di];
+    double h0 = from_s * DJ_RATE / DJ_HOP, span = (to_s - from_s) * DJ_RATE / DJ_HOP / n;
+    vlc_mutex_lock( &d->lock );
+    if( span >= OV_HOPS / 2 && d->ov )
+        for( int c = 0; c < n; c++ )
+        {
+            int64_t a = (int64_t)floor( (h0 + c * span) / OV_HOPS ), b = (int64_t)floor( (h0 + (c + 1) * span) / OV_HOPS );
+            if( b <= a ) b = a + 1;
+            if( a < 0 ) a = 0;
+            if( b > d->ov_n ) b = d->ov_n;
+            if( a >= b ) continue;
+            float mm = 0.f, mh = 0.f;
+            for( int64_t i = a; i < b; i++ )
+            {
+                mm = fmaxf( mm, d->ov[4 * i + 2] );
+                mh = fmaxf( mh, d->ov[4 * i + 3] );
+            }
+            mid[c] = mm;
+            high[c] = mh;
+        }
+    else if( d->env_mid )
+    {
+        int64_t lo = d->hops - d->hop_cap + 1;
+        if( lo < 0 ) lo = 0;
+        for( int c = 0; c < n; c++ )
+        {
+            int64_t a = (int64_t)floor( h0 + c * span ), b = (int64_t)floor( h0 + (c + 1) * span );
+            if( b <= a ) b = a + 1;
+            if( a < lo ) a = lo;
+            if( b > d->hops ) b = d->hops;
+            if( a >= b ) continue;
+            float mm = 0.f, mh = 0.f;
+            for( int64_t h = a; h < b; h++ )
+            {
+                int64_t k = h % d->hop_cap;
+                if( d->env_mid[k] > mm ) mm = d->env_mid[k];
+                if( d->env_hi[k] > mh ) mh = d->env_hi[k];
+            }
+            mid[c] = sqrtf( mm );
+            high[c] = sqrtf( mh );
+        }
+    }
+    vlc_mutex_unlock( &d->lock );
+}
+
 void dj_mix_Wave( dj_mix_t *m, int di, double from_s, double to_s, int n, float *low, float *full )
 {
     for( int c = 0; c < n; c++ ) low[c] = full[c] = -1.f;
@@ -2299,8 +2575,8 @@ void dj_mix_Wave( dj_mix_t *m, int di, double from_s, double to_s, int n, float 
             float ml = 0.f, mk = 0.f;
             for( int64_t i = a; i < b; i++ )
             {
-                ml = fmaxf( ml, d->ov[2 * i] );
-                mk = fmaxf( mk, d->ov[2 * i + 1] );
+                ml = fmaxf( ml, d->ov[4 * i] );
+                mk = fmaxf( mk, d->ov[4 * i + 1] );
             }
             low[c] = ml;
             full[c] = mk;

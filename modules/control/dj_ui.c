@@ -2430,6 +2430,15 @@ static bool HostWave( int deck, double from_s, double to_s, int n, float *low, f
     return ui != NULL;
 }
 
+static bool HostBands( int deck, double from_s, double to_s, int n, float *mid, float *high )
+{
+    vlc_mutex_lock( &host_lock );
+    dj_ui_t *ui = host_ui;
+    if( ui ) dj_mix_Bands( ui->mix, deck, from_s, to_s, n, mid, high );
+    vlc_mutex_unlock( &host_lock );
+    return ui != NULL;
+}
+
 static bool HostCommand( const char *verb )
 {
     vlc_mutex_lock( &host_lock );
@@ -2439,7 +2448,7 @@ static bool HostCommand( const char *verb )
     return ok;
 }
 
-static dj_host_t host_api = { HostAttach, HostDetach, HostStatus, dj_mix_StatusClean, HostWave, HostCommand };
+static dj_host_t host_api = { HostAttach, HostDetach, HostStatus, dj_mix_StatusClean, HostWave, HostCommand, HostBands };
 
 dj_ui_t *dj_ui_New( vlc_object_t *obj, dj_mix_t *mix, dj_brain_cb brain, dj_command_cb cmd, void *opaque,
                     const char *theme_path )

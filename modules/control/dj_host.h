@@ -31,7 +31,7 @@
 
 #include "dj.h"
 
-#define DJ_HOST_VAR "dj-host"
+#define DJ_HOST_VAR "dj-host-3"   /* the struct's generation: a host of another sees none */
 
 typedef struct dj_host
 {
@@ -43,6 +43,7 @@ typedef struct dj_host
     void (*status_clean)( dj_status_t * );
     bool (*wave)( int deck, double from_s, double to_s, int n, float *low, float *full );   /* as dj_mix_Wave */
     bool (*command)( const char *verb );   /* as the HTTP routes take them: "next", "air?on=1" */
+    bool (*bands)( int deck, double from_s, double to_s, int n, float *mid, float *high );   /* as dj_mix_Bands */
 } dj_host_t;
 
 #endif

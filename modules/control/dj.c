@@ -159,7 +159,7 @@ typedef struct
 
 typedef struct
 {
-    char *url, *title, *artist;
+    char *url, *title, *artist, *art;
     int64_t ms;     /* duration; 0 when unknown */
     bool endless;   /* a stream that never ends by itself: it rotates */
 } item_t;
@@ -218,10 +218,17 @@ struct intf_sys_t
     size_t          n_crate, cap_crate;
     int             cur_block, cur_pick, fill_block, fill_pick, air_block;
     char          **own;            /* the DJ's own crate: dj-persona.json's "plays" */
-    size_t          n_own;
+    size_t          n_own, own_next;   /* own_next: where its set is in the crate's written order */
     float           freedom;        /* the share of picks that are its own */
     time_t          own_at;         /* the file's time when read */
     int             set_from, set_len;   /* its own set, minutes from midnight, and long; -1 none */
+    char          **down;           /* records the listener voted down: dj-votes.txt */
+    char           *rec_wav;        /* the set being recorded */
+    vlc_thread_t    flac;           /* the last one, into FLAC */
+    bool            flac_on;
+    char           *flac_wav;
+    size_t          n_down;
+    time_t          down_at;
     time_t          pick_started, hold_until, other_since, dry_until;
     int             dry_block;
     char           *said, *cur_label, *last_error, *live_url, *live_np, *say_next;
@@ -614,6 +621,31 @@ static char *fetch_text( vlc_object_t *obj, const char *url, int tries, size_t m
         free( ms.ptr );
     }
     return NULL;
+}
+
+/* bytes, not text: a cover */
+static char *fetch_bytes( vlc_object_t *obj, const char *url, size_t max, size_t *len )
+{
+    int flags = obj->obj.flags;
+    obj->obj.flags |= OBJECT_FLAGS_NOINTERACT;
+    stream_t *s = vlc_stream_NewURL( obj, url );
+    obj->obj.flags = flags;
+    if( s == NULL ) return NULL;
+    struct vlc_memstream ms;
+    vlc_memstream_open( &ms );
+    char buf[16384];
+    ssize_t got;
+    bool ok = true;
+    while( ok && (got = vlc_stream_Read( s, buf, sizeof buf )) > 0 )
+    {
+        vlc_memstream_write( &ms, buf, got );
+        ok = ms.length <= max;
+    }
+    vlc_stream_Delete( s );
+    if( vlc_memstream_close( &ms ) ) return NULL;
+    if( !ok ) { free( ms.ptr ); return NULL; }
+    *len = ms.length;
+    return ms.ptr;
 }
 
 static json_value *fetch_json( vlc_object_t *obj, const char *url, int tries )
@@ -1251,6 +1283,19 @@ static void sc_item( const json_value *t, item_t *it )
     it->artist = user ? json_dupstring( user, "username" ) : NULL;
     it->ms = jint( t, "duration" );
     it->endless = false;
+    const char *art = jsongetstring( t, "artwork_url" );   /* the track's cover, else its artist's */
+    if( (art == NULL || !*art) && user ) art = jsongetstring( user, "avatar_url" );
+    if( art && *art )
+    {
+        it->art = strdup( art );
+        char *large = it->art ? strstr( it->art, "-large." ) : NULL;   /* 100 pixels: ask for 500 */
+        char *big = NULL;
+        if( large && asprintf( &big, "%.*s-t500x500.%s", (int)(large - it->art), it->art, large + 7 ) > 0 )
+        {
+            free( it->art );
+            it->art = big;
+        }
+    }
 }
 
 /* a set's tracks in order; most come as bare ids and are fetched fifty at a time */
@@ -1319,7 +1364,7 @@ static item_t *sc_set_items( vlc_object_t *obj, const json_value *set, size_t ma
 
 static void items_free( item_t *it, size_t n )
 {
-    for( size_t i = 0; it && i < n; i++ ) { free( it[i].url ); free( it[i].title ); free( it[i].artist ); }
+    for( size_t i = 0; it && i < n; i++ ) { free( it[i].url ); free( it[i].title ); free( it[i].artist ); free( it[i].art ); }
     free( it );
 }
 
@@ -1538,6 +1583,7 @@ static item_t *rb_items( intf_sys_t *sys, const char *spec, size_t *n, char **er
         const char *url = rb_url( s );
         if( jint( s, "lastcheckok" ) != 1 || url == NULL ) continue;
         if( (it = calloc( 1, sizeof *it )) == NULL ) break;
+        it->art = json_dupstring( s, "favicon" );
         it->url = strdup( url );
         it->title = json_dupstring( s, "name" );
         it->endless = true;
@@ -1591,8 +1637,86 @@ static bool is_audio_file( const char *url )
     return false;
 }
 
+/* A folder of the listener's own: its records, at random, to four folders deep. The same record
+ * in two formats plays from the lossless one */
+static bool is_lossless( const char *name )
+{
+    const char *dot = strrchr( name, '.' );
+    static const char *const ext[] = { ".flac", ".wav", ".aiff", ".aif", ".wv", ".ape", ".alac" };
+    for( size_t i = 0; dot && i < ARRAY_SIZE(ext); i++ ) if( !strcasecmp( dot, ext[i] ) ) return true;
+    return false;
+}
+
+static void folder_scan( const char *dir, int depth, char ***out, size_t *n, size_t *cap )
+{
+    DIR *d = vlc_opendir( dir );
+    if( d == NULL ) return;
+    const char *e;
+    while( (e = vlc_readdir( d )) && *n < 20000 )
+    {
+        if( e[0] == '.' ) continue;
+        char *path;
+        if( asprintf( &path, "%s" DIR_SEP "%s", dir, e ) < 0 ) continue;
+        struct stat st;
+        if( vlc_stat( path, &st ) == 0 && S_ISDIR( st.st_mode ) )
+        {
+            if( depth > 0 ) folder_scan( path, depth - 1, out, n, cap );
+            free( path );
+            continue;
+        }
+        if( !is_audio_file( path ) && !is_lossless( path ) ) { free( path ); continue; }
+        if( *n == *cap )
+        {
+            char **g = realloc( *out, (*cap = *cap ? 2 * *cap : 256) * sizeof *g );
+            if( g == NULL ) { free( path ); break; }
+            *out = g;
+        }
+        (*out)[(*n)++] = path;
+    }
+    closedir( d );
+}
+
+static size_t stem_len( const char *p )
+{
+    const char *dot = strrchr( p, '.' );
+    return dot ? (size_t)(dot - p) : strlen( p );
+}
+
+static item_t *folder_items( const char *dir, size_t max, size_t *n )
+{
+    char **f = NULL;
+    size_t nf = 0, cap = 0;
+    folder_scan( dir, 4, &f, &nf, &cap );
+    /* a lossy copy of a record that is here lossless too goes */
+    for( size_t i = 0; i < nf; i++ )
+        for( size_t j = 0; f[i] && j < nf; j++ )
+            if( i != j && f[j] && stem_len( f[i] ) == stem_len( f[j] ) && !strncmp( f[i], f[j], stem_len( f[i] ) )
+             && is_lossless( f[j] ) && !is_lossless( f[i] ) )
+                { free( f[i] ); f[i] = NULL; }
+    size_t k = 0;
+    for( size_t i = 0; i < nf; i++ ) if( f[i] ) f[k++] = f[i];
+    nf = k;
+    for( size_t i = nf; i > 1; i-- )
+    {
+        size_t j = (unsigned long)vlc_mrand48() % i;
+        char *t = f[i - 1]; f[i - 1] = f[j]; f[j] = t;
+    }
+    size_t take = nf < max ? nf : max;
+    item_t *it = take ? calloc( take, sizeof *it ) : NULL;
+    for( size_t i = 0; it && i < take; i++ )
+    {
+        const char *base = strrchr( f[i], DIR_SEP_CHAR );
+        it[i].url = vlc_path2uri( f[i], NULL );
+        it[i].title = strndup( base ? base + 1 : f[i], stem_len( base ? base + 1 : f[i] ) );
+    }
+    for( size_t i = 0; i < nf; i++ ) free( f[i] );
+    free( f );
+    *n = it ? take : 0;
+    return it;
+}
+
 /* a station id or a word of its title, sc:<words>, sc:set <words>, a soundcloud.com page,
- * rb:<tag> or rb:<field>=<value>, ia:<archive.org item>, a URL, a path */
+ * rb:<tag> or rb:<field>=<value>, ia:<archive.org item>, a URL, a path: a file or a folder */
 static item_t *resolve( intf_sys_t *sys, const char *target, size_t max, size_t *n, char **err, char **label )
 {
     *n = 0;
@@ -1626,6 +1750,9 @@ static item_t *resolve( intf_sys_t *sys, const char *target, size_t max, size_t 
                 for( char *p; (p = strstr( it[i].url + strlen( IA "/download/" ), "%2F" )); )
                     { *p = '/'; memmove( p + 1, p + 3, strlen( p + 3 ) + 1 ); }
             it[i].title = strdup( f[i].title );
+            const char *slash = strchr( target + 3, '/' );
+            if( asprintf( &it[i].art, IA "/services/img/%.*s", slash ? (int)(slash - target - 3) : (int)strlen( target + 3 ), target + 3 ) < 0 )
+                it[i].art = NULL;
             it[i].ms = length_ms( f[i].length );
         }
         ia_free( f, nf );
@@ -1644,6 +1771,19 @@ static item_t *resolve( intf_sys_t *sys, const char *target, size_t max, size_t 
     }
     else if( is_path( target ) )
     {
+        char *folder = strdup( target );
+        for( char *c = folder; c && *c; c++ ) if( *c == '/' ) *c = DIR_SEP_CHAR;
+        struct stat st;
+        if( folder && vlc_stat( folder, &st ) == 0 && S_ISDIR( st.st_mode ) )
+        {
+            free( it );
+            it = folder_items( folder, max, n );
+            free( folder );
+            if( it == NULL ) { *err = json_error( "no records in %s", target ); return NULL; }
+            *label = strdup( target );
+            return it;
+        }
+        free( folder );
         const char *base = strrchr( target, '\\' ) ? strrchr( target, '\\' ) : strrchr( target, '/' );
         char *native = strdup( target );   /* vlc_path2uri wants the platform's own separators */
         for( char *c = native; c && *c; c++ ) if( *c == '/' ) *c = DIR_SEP_CHAR;
@@ -1944,11 +2084,47 @@ static void crate_clear( intf_sys_t *sys, bool keep_requests )
 }
 
 /* a pick's tracks: a request ahead of the DJ's own, behind the requests before it */
+/* the listener's thumbs down, read again when the page writes one */
+static void votes_load( intf_sys_t *sys )
+{
+    char *dir = config_GetUserDir( VLC_CONFIG_DIR ), *path = NULL;
+    if( dir == NULL || asprintf( &path, "%s" DIR_SEP "dj-votes.txt", dir ) < 0 ) path = NULL;
+    free( dir );
+    struct stat st;
+    time_t at = path && vlc_stat( path, &st ) == 0 ? st.st_mtime : 0;
+    if( at == sys->down_at ) { free( path ); return; }
+    sys->down_at = at;
+    char *text = at ? read_file( path ) : NULL;
+    free( path );
+    for( char *line = text, *eol; line && *line; line = eol ? eol + 1 : NULL )
+    {
+        eol = strchr( line, '\n' );
+        if( eol ) *eol = '\0';
+        char *tab = strchr( line, '\t' ), *end = tab ? strchr( tab + 1, '\t' ) : NULL;
+        if( strncmp( line, "down\t", 5 ) || end == NULL ) continue;
+        *end = '\0';
+        bool known = false;
+        for( size_t i = 0; i < sys->n_down && !known; i++ ) known = !strcmp( sys->down[i], tab + 1 );
+        char **g = known ? NULL : realloc( sys->down, (sys->n_down + 1) * sizeof *g );
+        if( g == NULL ) continue;
+        sys->down = g;
+        if( (g[sys->n_down] = strdup( tab + 1 )) ) sys->n_down++;
+    }
+    free( text );
+}
+
+static bool voted_down( const intf_sys_t *sys, const char *url )
+{
+    for( size_t i = 0; url && i < sys->n_down; i++ ) if( !strcmp( sys->down[i], url ) ) return true;
+    return false;
+}
+
 static void crate_add( intf_sys_t *sys, const item_t *items, size_t n, int block, int pick,
                        bool requested, const char *label )
 {
+    votes_load( sys );
     size_t k = 0;
-    for( size_t i = 0; i < n; i++ ) if( items[i].url ) k++;
+    for( size_t i = 0; i < n; i++ ) if( items[i].url && !(!requested && voted_down( sys, items[i].url )) ) k++;
     if( sys->n_crate + k > sys->cap_crate )
     {
         size_t cap = sys->cap_crate ? sys->cap_crate : 64;
@@ -1964,13 +2140,14 @@ static void crate_add( intf_sys_t *sys, const item_t *items, size_t n, int block
     memmove( &sys->crate[at + k], &sys->crate[at], (sys->n_crate - at) * sizeof *sys->crate );
     for( size_t i = 0, j = at; i < n; i++ )
     {
-        if( items[i].url == NULL ) continue;
+        if( items[i].url == NULL || (!requested && voted_down( sys, items[i].url )) ) continue;
         dj_track_t *t = &sys->crate[j++];
         memset( t, 0, sizeof *t );
         t->url = strdup( items[i].url );
         t->title = items[i].title ? strdup( items[i].title ) : NULL;
         t->artist = items[i].artist ? strdup( items[i].artist ) : NULL;
         t->label = label ? strdup( label ) : NULL;
+        t->art = items[i].art ? strdup( items[i].art ) : NULL;
         t->length_ms = items[i].ms;
         t->endless = items[i].endless;
         t->requested = requested;
@@ -2038,7 +2215,7 @@ static void own_load( intf_sys_t *sys )
     for( size_t i = 0; i < sys->n_own; i++ ) free( sys->own[i] );
     free( sys->own );
     sys->own = NULL;
-    sys->n_own = 0;
+    sys->n_own = sys->own_next = 0;
     sys->freedom = 0.f;
     sys->set_from = -1;
     sys->set_len = 0;
@@ -2092,7 +2269,9 @@ static bool refill_own( intf_sys_t *sys, int block, bool always )
     own_load( sys );
     always = always || own_set_now( sys );   /* its own set: all its own */
     if( sys->n_own == 0 || (!always && (vlc_mrand48() & 0xffff) >= (long)(sys->freedom * 65536.f)) ) return false;
-    const char *target = sys->own[(unsigned long)vlc_mrand48() % sys->n_own];
+    /* in its set the crate plays as written, an arc; elsewhere a pick at random */
+    const char *target = own_set_now( sys ) ? sys->own[sys->own_next++ % sys->n_own]
+                                            : sys->own[(unsigned long)vlc_mrand48() % sys->n_own];
     size_t n;
     char *err = NULL, *label = NULL, *mine = NULL;
     item_t *items = resolve( sys, target, sys->per_pick, &n, &err, &label );
@@ -2149,12 +2328,43 @@ static bool refill( intf_sys_t *sys, int block, bool fresh )
     return true;
 }
 
+/* the cover into the cache, once, as the track is cued: the page reads a file, never the net */
+static void art_fetch( intf_sys_t *sys, dj_track_t *t )
+{
+    if( t->art == NULL || strncmp( t->art, "http", 4 ) ) return;
+    uint32_t h = 2166136261u;
+    for( const char *c = t->art; *c; c++ ) h = (h ^ (unsigned char)*c) * 16777619u;
+    char *dir = config_GetUserDir( VLC_CONFIG_DIR ), *path = NULL;
+    if( dir && asprintf( &path, "%s" DIR_SEP "dj-art", dir ) > 0 ) vlc_mkdir( path, 0700 );
+    free( path );
+    if( dir == NULL || asprintf( &path, "%s" DIR_SEP "dj-art" DIR_SEP "%08x", dir, (unsigned)h ) < 0 ) path = NULL;
+    free( dir );
+    if( path == NULL ) return;
+    struct stat st;
+    if( vlc_stat( path, &st ) != 0 )
+    {
+        size_t n = 0;
+        char *bytes = fetch_bytes( VLC_OBJECT(sys->intf), t->art, 4 << 20, &n );
+        FILE *f = bytes && n > 64 ? vlc_fopen( path, "wb" ) : NULL;
+        if( f )
+        {
+            fwrite( bytes, 1, n, f );
+            fclose( f );
+        }
+        free( bytes );
+        if( vlc_stat( path, &st ) != 0 ) { free( path ); return; }
+    }
+    free( t->art );
+    t->art = path;
+}
+
 /* the crate's first track into the free deck */
 static bool cue_next( intf_sys_t *sys, int block )
 {
     if( sys->n_crate == 0 && !refill( sys, block, false ) ) return false;
     dj_track_t t;
     if( !crate_pop( sys, &t ) ) return false;
+    art_fetch( sys, &t );
     dj_mix_Cue( sys->mix, &t );
     dj_track_Clean( &t );
     return true;
@@ -2774,6 +2984,81 @@ static char *do_remove( intf_sys_t *sys, const uint8_t *args )
     return state_json( sys );
 }
 
+/* WAV into FLAC by VLC's own encoder, then the length the raw mux could not go back for */
+static void *FlacThread( void *data )
+{
+    intf_sys_t *sys = data;
+    char *wav = sys->flac_wav, *flac = NULL, *opt = NULL, *uri = vlc_path2uri( wav, NULL );
+    if( uri == NULL ) goto out;
+    if( asprintf( &flac, "%.*s.flac", (int)(strlen( wav ) - 4), wav ) < 0 ) { flac = NULL; goto out; }
+    if( asprintf( &opt, "sout=#transcode{acodec=flac}:std{access=file,mux=raw,dst='%s'}", flac ) < 0 ) { opt = NULL; goto out; }
+    for( char *c = strstr( opt, "dst='" ); c && *c; c++ ) if( *c == DIR_SEP_CHAR ) *c = '/';   /* the chain parser's quotes keep no backslash */
+    input_item_t *item = input_item_New( uri, "DJ set" );
+    if( item == NULL ) goto out;
+    input_item_AddOption( item, opt, VLC_INPUT_OPTION_TRUSTED );
+    input_item_AddOption( item, "sout-keep", VLC_INPUT_OPTION_TRUSTED );
+    input_Read( sys->intf, item );
+    input_item_Release( item );
+    struct stat sw;
+    FILE *f = vlc_fopen( flac, "r+b" );
+    uint8_t h[26];
+    bool good = f && fread( h, 1, sizeof h, f ) == sizeof h && !memcmp( h, "fLaC", 4 ) && vlc_stat( wav, &sw ) == 0;
+    if( good )   /* STREAMINFO's 36 bits of samples */
+    {
+        uint64_t n = (uint64_t)(sw.st_size - 44) / 6;
+        h[21] = (uint8_t)((h[21] & 0xf0) | ((n >> 32) & 0x0f));
+        SetDWBE( h + 22, (uint32_t)n );
+        fseek( f, 21, SEEK_SET );
+        fwrite( h + 21, 1, 5, f );
+    }
+    if( f ) fclose( f );
+    if( good ) vlc_unlink( wav );
+    dj_log( sys, good ? "set recorded" : "set kept as WAV", good ? flac : wav );
+out:
+    free( opt ); free( uri ); free( flac );
+    return NULL;
+}
+
+/* on=1 records the set from here, on=0 ends it and makes it FLAC */
+static char *do_record( intf_sys_t *sys, const uint8_t *args )
+{
+    char *on = qarg( args, "on" );
+    bool want = on && strcmp( on, "0" ) && strcmp( on, "off" );
+    free( on );
+    if( want && sys->rec_wav == NULL )
+    {
+        char *music = config_GetUserDir( VLC_MUSIC_DIR ), *dir = NULL, *path = NULL;
+        time_t now = time( NULL );
+        struct tm tm;
+        local_tm( now, &tm );
+        char stamp[32];
+        strftime( stamp, sizeof stamp, "%Y-%m-%d %H%M", &tm );
+        if( music && asprintf( &dir, "%s" DIR_SEP "VLC DJ", music ) > 0 )
+        {
+            vlc_mkdir( dir, 0700 );
+            if( asprintf( &path, "%s" DIR_SEP "DJ set %s.wav", dir, stamp ) < 0 ) path = NULL;
+        }
+        free( music ); free( dir );
+        if( path == NULL || dj_mix_Record( sys->mix, path ) < 0 )
+        {
+            free( path );
+            return json_error( "cannot record into the Music folder" );
+        }
+        sys->rec_wav = path;
+        dj_log( sys, "recording", path );
+    }
+    else if( !want && sys->rec_wav )
+    {
+        dj_mix_Record( sys->mix, NULL );
+        if( sys->flac_on ) { vlc_join( sys->flac, NULL ); free( sys->flac_wav ); sys->flac_on = false; }
+        sys->flac_wav = sys->rec_wav;
+        sys->rec_wav = NULL;
+        sys->flac_on = !vlc_clone( &sys->flac, FlacThread, sys, VLC_THREAD_PRIORITY_LOW );
+        if( !sys->flac_on ) { free( sys->flac_wav ); sys->flac_wav = NULL; }
+    }
+    return state_json( sys );
+}
+
 static char *do_now( intf_sys_t *sys )
 {
     char *st = state_json( sys );
@@ -2886,6 +3171,33 @@ static char *dispatch_locked( intf_sys_t *sys, const char *verb, const uint8_t *
     if( !strcmp( verb, "clear" ) )   { crate_clear( sys, false ); dj_mix_Clear( sys->mix ); sys->hold_until = 0; dj_log( sys, "clear", NULL ); return state_json( sys ); }
     if( !strcmp( verb, "deck" ) )      return do_deck( sys );
     if( !strcmp( verb, "remove" ) )    return do_remove( sys, args );
+    if( !strcmp( verb, "record" ) )    return do_record( sys, args );
+    if( !strcmp( verb, "fader" ) )   /* x=-1..1 takes it, x=dj gives it back */
+    {
+        char *x = qarg( args, "x" );
+        dj_mix_Fader( sys->mix, x == NULL || !strcmp( x, "dj" ) ? NAN : us_strtof( x, NULL ) );
+        free( x );
+        return state_json( sys );
+    }
+    if( !strcmp( verb, "bass" ) )    /* deck=0|1, db=-26..6 */
+    {
+        char *dk = qarg( args, "deck" ), *db = qarg( args, "db" );
+        if( dk && db ) dj_mix_Bass( sys->mix, atoi( dk ), us_strtof( db, NULL ) );
+        free( dk ); free( db );
+        return state_json( sys );
+    }
+    if( !strcmp( verb, "up" ) )      /* i=N: Up next's N-th, played next */
+    {
+        char *is = qarg( args, "i" );
+        size_t i = is ? (size_t)strtoul( is, NULL, 10 ) : 0;
+        free( is );
+        if( i >= sys->n_crate ) return json_error( "no such record in the crate" );
+        dj_track_t t = sys->crate[i];
+        memmove( &sys->crate[1], &sys->crate[0], i * sizeof *sys->crate );
+        sys->crate[0] = t;
+        dj_log( sys, "up next", t.title );
+        return state_json( sys );
+    }
     if( !strcmp( verb, "volume" ) )    return do_volume( sys, args );
     if( !strcmp( verb, "say" ) )       return do_say( sys, args );
     if( !strcmp( verb, "stations" ) )  return do_stations( sys, args );
@@ -3081,6 +3393,26 @@ static void BrainCb( void *opaque, dj_brain_t *out )
 
 static bool CommandCb( void *opaque, const char *cmd )
 {
+    intf_sys_t *sys = opaque;
+    /* hands on the mixer: at once, never behind a lookup in the queue */
+    const char *q = strchr( cmd, '?' );
+    if( q && sys->mix && (!strncmp( cmd, "fader?", 6 ) || !strncmp( cmd, "bass?", 5 )) )
+    {
+        const uint8_t *args = (const uint8_t *)(q + 1);
+        if( cmd[0] == 'f' )
+        {
+            char *x = qarg( args, "x" );
+            dj_mix_Fader( sys->mix, x == NULL || !strcmp( x, "dj" ) ? NAN : us_strtof( x, NULL ) );
+            free( x );
+        }
+        else
+        {
+            char *dk = qarg( args, "deck" ), *db = qarg( args, "db" );
+            if( dk && db ) dj_mix_Bass( sys->mix, atoi( dk ), us_strtof( db, NULL ) );
+            free( dk ); free( db );
+        }
+        return true;
+    }
     return cmd_push( opaque, cmd );
 }
 
@@ -3239,6 +3571,12 @@ static void Close( vlc_object_t *obj )
         if( sys->routes[i].url ) httpd_UrlDelete( sys->routes[i].url );
     for( size_t i = 0; i < sys->n_own; i++ ) free( sys->own[i] );
     free( sys->own );
+    if( sys->rec_wav && sys->mix ) dj_mix_Record( sys->mix, NULL );   /* a whole WAV, made FLAC next time */
+    free( sys->rec_wav );
+    if( sys->flac_on ) vlc_join( sys->flac, NULL );
+    free( sys->flac_wav );
+    for( size_t i = 0; i < sys->n_down; i++ ) free( sys->down[i] );
+    free( sys->down );
     free( sys->routes );
     if( sys->host ) httpd_HostDelete( sys->host );
     if( sys->mix ) dj_mix_Delete( sys->mix );
