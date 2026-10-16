@@ -1117,6 +1117,9 @@ void MainInterface::showDjDeck()
 {
     if( !hasDjDeck() )
         return;
+    /* a video keeps its place: View > DJ Deck still brings the deck over it */
+    if( videoWidget && stackCentralW->currentWidget() == videoWidget && THEMIM->getIM()->hasVideo() )
+        return;
     showTab( djDeck );
     emit askRaise();
 }
