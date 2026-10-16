@@ -33,6 +33,7 @@
 struct dj_host;
 struct DjNow;
 class DjRecords;
+class DjAvatar;
 class QLabel;
 class QCheckBox;
 class QComboBox;
@@ -44,8 +45,8 @@ class QProgressBar;
 class QGridLayout;
 class QTimer;
 
-/* The DJ, as a page of the main window, in VLC's own widgets: the records under the playhead,
- * the two decks and the mix between them, what comes next, the moods and a request. */
+/* The DJ, as a page of the main window, in VLC's own widgets: the DJ itself, the records under
+ * the playhead, the two decks and the mix between them, what comes next, the moods, a request. */
 class DjDeck : public QWidget
 {
     Q_OBJECT
@@ -90,11 +91,14 @@ private:
     QCheckBox    *air;
     QComboBox    *voice;
     DjRecords    *records;
+    DjAvatar     *avatar;
+    QLabel       *spin;
+    QProgressBar *mixProgress;
     struct Side
     {
         QGroupBox *box;
         QLabel    *title, *artist, *source, *detail, *time;
-        QProgressBar *level;
+        QProgressBar *level, *progress;
     } side[2];
     QSlider      *xfade;
     QListWidget  *upNext;

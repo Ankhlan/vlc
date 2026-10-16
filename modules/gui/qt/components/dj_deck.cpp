@@ -33,7 +33,9 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QIcon>
 #include <QPainter>
+#include <QPainterPath>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QSlider>
@@ -201,8 +203,27 @@ private:
         QString tag = QString( d ? "B" : "A" );
         if( in->state != DJ_LIVE && in->state >= 0 && in->state < 6 )
             tag += "   " + qtr( states[in->state] );
+        QFontMetrics fm( font() );
+        QRect line( r.x() + 6, r.y() + 3, r.width() - 12, fm.height() );
+        QString left, title;
+        if( in->state != DJ_EMPTY )
+        {
+            title = qfu( in->now_playing && *in->now_playing ? in->now_playing : in->t.title ? in->t.title : "" );
+            if( in->length_s > 0. ) left = qfu( "\xe2\x88\x92" ) + clock( in->length_s - shown[d] );
+        }
+        int tw = fm.boundingRect( tag ).width() + 14, lw = left.isEmpty() ? 0 : fm.boundingRect( left ).width() + 14;
+        title = fm.elidedText( title, Qt::ElideRight, qMax( 0, line.width() - tw - lw ) );
+        QColor veil = pal.color( QPalette::Base );   /* the words over the record, legible */
+        veil.setAlpha( 190 );
+        p.fillRect( QRect( line.x() - 3, line.y(), tw + fm.boundingRect( title ).width() + 6, line.height() ), veil );
+        if( lw ) p.fillRect( QRect( line.right() - lw + 9, line.y(), lw - 6, line.height() ), veil );
         p.setPen( pal.color( QPalette::Text ) );
-        p.drawText( r.adjusted( 6, 3, -6, -3 ), Qt::AlignLeft | Qt::AlignTop, tag );
+        p.drawText( line, Qt::AlignLeft | Qt::AlignTop, tag );
+        p.drawText( line, Qt::AlignRight | Qt::AlignTop, left );
+        QColor dim = pal.color( QPalette::Text );
+        dim.setAlpha( 170 );
+        p.setPen( dim );
+        p.drawText( line.adjusted( tw, 0, 0, 0 ), Qt::AlignLeft | Qt::AlignTop, title );
     }
 
     void whole( QPainter &p, int d, QRect r )
@@ -215,6 +236,72 @@ private:
         p.setPen( QPen( palette().color( QPalette::Text ), 1.5 ) );
         p.drawLine( QPointF( x, r.top() ), QPointF( x, r.bottom() ) );
     }
+};
+
+/* The DJ: VLC's cone with its headphones on, nodding to the live record's beat; off air, the
+ * headphones come off. */
+class DjAvatar : public QWidget
+{
+public:
+    DjAvatar( const DjNow *n, const DjRecords *r, QWidget *parent )
+        : QWidget( parent ), now( n ), rec( r ), cone( ":/logo/vlc256.png" )
+    {
+        setFixedSize( 72, 80 );
+    }
+
+protected:
+    void paintEvent( QPaintEvent * ) Q_DECL_OVERRIDE
+    {
+        QPainter p( this );
+        p.setRenderHints( QPainter::Antialiasing | QPainter::SmoothPixmapTransform );
+        const dj_status_t *st = &now->st;
+        bool on = now->have && now->br.on_air;
+        int live = now->have ? st->live : -1;
+        double pulse = 0., tilt = 0.;
+        if( on && live >= 0 && live < DJ_DECKS && st->attached && !st->paused )
+        {
+            const dj_grid_t *g = &st->deck[live].grid;
+            if( g->period > 0. )   /* a nod on every beat, the head the other way on the next */
+            {
+                double b = (rec->shown[live] * DJ_RATE - g->phase) / g->period, k = floor( b );
+                pulse = exp( -(b - k) * 7. );
+                tilt = (((long long)k & 1) ? 2.5 : -2.5) * pulse;
+            }
+            else   /* no steady beat: a sway */
+                tilt = 2. * sin( mdate() / (double)CLOCK_FREQ * M_PI );
+        }
+        double s = (height() - 12) / 256.;
+        p.translate( width() / 2., height() - 2 - 4. * pulse );
+        p.rotate( tilt );
+        p.scale( s, s );
+        p.translate( -128., -256. );
+        p.setOpacity( on ? 1. : .5 );
+        p.drawPixmap( 0, 0, cone );
+        if( !on ) return;
+        QPainterPath band;   /* over the tip, from cup to cup */
+        band.moveTo( 86, 60 );
+        band.cubicTo( 84, -26, 172, -26, 170, 60 );
+        p.setPen( QPen( QColor( 0x2e, 0x2e, 0x2e ), 11, Qt::SolidLine, Qt::RoundCap ) );
+        p.drawPath( band );
+        p.setPen( QPen( QColor( 0x6a, 0x6a, 0x6a ), 3, Qt::SolidLine, Qt::RoundCap ) );
+        p.drawPath( band );
+        QLinearGradient shell( 0, 50, 0, 106 );
+        shell.setColorAt( 0., QColor( 0x55, 0x55, 0x55 ) );
+        shell.setColorAt( 1., QColor( 0x22, 0x22, 0x22 ) );
+        QColor rim = palette().color( QPalette::Highlight );
+        for( int side = 0; side < 2; side++ )
+        {
+            QRectF cup = side ? QRectF( 160, 50, 28, 56 ) : QRectF( 68, 50, 28, 56 );
+            p.setPen( QPen( rim, 3 ) );
+            p.setBrush( shell );
+            p.drawRoundedRect( cup, 11, 11 );
+        }
+    }
+
+private:
+    const DjNow *now;
+    const DjRecords *rec;
+    QPixmap cone;
 };
 
 DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
@@ -237,16 +324,31 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
     voice->addItem( qtr( "Voice off" ) );
     voice->addItem( qtr( "Voice between blocks" ) );
     voice->addItem( qtr( "Voice over everything" ) );
-    head->addWidget( block );
-    head->addSpacing( 12 );
-    head->addWidget( nextBlock );
-    head->addStretch();
-    head->addWidget( air );
-    head->addSpacing( 6 );
-    head->addWidget( voice );
-    main->addLayout( head );
-
     records = new DjRecords( now, this );
+    avatar = new DjAvatar( now, records, this );
+    said = new QLabel;   /* what the DJ says, or means to do */
+    said->setWordWrap( true );
+    said->setSizePolicy( QSizePolicy::Ignored, QSizePolicy::Preferred );
+    QFont italic = said->font();
+    italic.setItalic( true );
+    said->setFont( italic );
+    QHBoxLayout *when = new QHBoxLayout;
+    when->addWidget( block );
+    when->addSpacing( 12 );
+    when->addWidget( nextBlock );
+    when->addStretch();
+    QVBoxLayout *who = new QVBoxLayout;
+    who->addStretch();
+    who->addLayout( when );
+    who->addWidget( said );
+    who->addStretch();
+    head->addWidget( avatar );
+    head->addSpacing( 6 );
+    head->addLayout( who, 1 );
+    head->addWidget( air, 0, Qt::AlignTop );
+    head->addSpacing( 6 );
+    head->addWidget( voice, 0, Qt::AlignTop );
+    main->addLayout( head );
     main->addWidget( records, 3 );
 
     /* the decks, and the mix between them */
@@ -277,6 +379,11 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
         v->addWidget( s.source );
         v->addStretch();
         v->addLayout( row );
+        s.progress = new QProgressBar;
+        s.progress->setRange( 0, 1000 );
+        s.progress->setTextVisible( false );
+        s.progress->setMaximumHeight( 4 );
+        v->addWidget( s.progress );
         s.level = new QProgressBar;
         s.level->setRange( 0, 600 );
         s.level->setTextVisible( false );
@@ -296,7 +403,14 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
     levels->addSpacing( 8 );
     levels->addWidget( side[1].level );
     levels->addWidget( new QLabel( "B" ) );
+    transition->setFont( bold );
+    mixProgress = new QProgressBar;
+    mixProgress->setRange( 0, 100 );
+    mixProgress->setTextVisible( false );
+    mixProgress->setMaximumHeight( 4 );
+    mixProgress->hide();
     m->addWidget( transition );
+    m->addWidget( mixProgress );
     m->addStretch();
     m->addWidget( xfade );
     m->addLayout( levels );
@@ -325,7 +439,17 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
     QPushButton *mixNow = new QPushButton( qtr( "&Mix next now" ) ), *pick = new QPushButton( qtr( "DJ's &choice" ) );
     mixNow->setToolTip( qtr( "Bring the next record in now" ) );
     pick->setToolTip( qtr( "Let the DJ pick what comes next" ) );
-    r->addWidget( field, 0, 0, 1, 2 );
+    play->setIcon( QIcon( ":/toolbar/play_b.svg" ) );
+    queued->setIcon( QIcon( ":/buttons/playlist/playlist_add.svg" ) );
+    mixNow->setIcon( QIcon( ":/toolbar/next_b.svg" ) );
+    pick->setIcon( QIcon( ":/buttons/playlist/shuffle_on.svg" ) );
+    spin = new QLabel;   /* the DJ looking for a request */
+    spin->setFixedSize( 16, 16 );
+    spin->hide();
+    QHBoxLayout *ask = new QHBoxLayout;
+    ask->addWidget( field );
+    ask->addWidget( spin );
+    r->addLayout( ask, 0, 0, 1, 2 );
     r->addWidget( play, 1, 0 );
     r->addWidget( queued, 1, 1 );
     r->addWidget( mixNow, 2, 0 );
@@ -337,11 +461,9 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
     main->addLayout( bottom, 2 );
 
     QHBoxLayout *foot = new QHBoxLayout;
-    said = new QLabel;
-    said->setSizePolicy( QSizePolicy::Ignored, QSizePolicy::Preferred );
     mixLine = new QLabel;
     quiet( mixLine );
-    foot->addWidget( said, 1 );
+    foot->addStretch();
     foot->addWidget( mixLine );
     main->addLayout( foot );
 
@@ -436,6 +558,22 @@ void DjDeck::tick()
         side[d].level->setValue( heard ? (int)((in->level_db + 60.f) * 10.f) : 0 );
     }
     xfade->setValue( (int)lroundf( st->xfade * 100.f ) );
+    for( int d = 0; d < 2; d++ )
+    {
+        const dj_deck_info_t *in = &st->deck[d];
+        bool known = in->state != DJ_EMPTY && in->length_s > 0.;
+        side[d].progress->setVisible( known );
+        if( known ) side[d].progress->setValue( (int)(qBound( 0., records->shown[d] / in->length_s, 1. ) * 1000.) );
+    }
+    mixProgress->setVisible( st->running );
+    mixProgress->setValue( (int)(st->progress * 100.) );
+    avatar->update();
+    if( ticks % 4 == 0 )
+    {
+        if( now->br.busy )
+            spin->setPixmap( QIcon( QString( ":/util/wait%1.svg" ).arg( ticks / 4 % 4 + 1 ) ).pixmap( 16, 16 ) );
+        spin->setVisible( now->br.busy );
+    }
     if( ticks++ % 8 == 0 ) words();
 }
 
@@ -510,6 +648,10 @@ void DjDeck::words()
                           : qtr( "%1 in %2" ).arg( kind, clock( st->starts_in_s ) );
     else if( st->loading )
         t = qtr( "Cueing the next record" );
+    else if( st->cue >= 0 )
+        t = qtr( "Next record cued" );
+    else if( st->live >= 0 )
+        t = qtr( "Playing it through" );
     transition->setText( t );
     transition->setToolTip( qfu( st->note ) );
 
@@ -550,7 +692,9 @@ void DjDeck::words()
     QPalette pal = palette();
     if( error ) pal.setColor( QPalette::WindowText, QColor( 0xc4, 0x2b, 0x1c ) );
     said->setPalette( pal );
-    elide( said, qfu( error ? br->error : br->said[0] ? br->said : st->note ) );
+    if( error ) said->setText( qfu( br->error ) );
+    else if( br->said[0] ) said->setText( qfu( "\xe2\x80\x9c" ) + qfu( br->said ) + qfu( "\xe2\x80\x9d" ) );
+    else said->setText( qfu( st->note ) );
     QString line = qtr( "Mixed %1" ).arg( clock( st->mixed_s ) ) + dot + qtr( "48 kHz float" );
     if( st->out_db > -120.f ) line += dot + qtr( "Out %1 dB" ).arg( st->out_db, 0, 'f', 1 );
     if( st->gr_db < -.05f ) line += dot + qtr( "Limiter %1 dB" ).arg( st->gr_db, 0, 'f', 1 );
