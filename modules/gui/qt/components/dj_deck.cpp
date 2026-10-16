@@ -41,18 +41,28 @@
 #include <QJsonObject>
 #include <QFile>
 #include <QIcon>
+#include <QImage>
+#include <QTabWidget>
 #include <QTextStream>
+#include <QToolButton>
+#include <QCoreApplication>
 #include <QTime>
 #include <QPainter>
 #include <QPainterPath>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QSignalBlocker>
 #include <QSlider>
+#include <QDial>
 #include <QTimer>
 #include <QUrl>
 #include <QVector>
 #include <QWheelEvent>
 #include <QApplication>
+#include <QGuiApplication>
+#include <QKeyEvent>
+#include <QScreen>
+#include <QWindow>
 #include <math.h>
 
 /* what the DJ showed last: the deck's thread fills it, a tick at a time */
@@ -161,24 +171,42 @@ private:
         return c;
     }
 
+    /* bass, mids and highs in three colours, the way a booth shows them: VLC's blue for the
+       bass, its cone's orange for the mids, near white for the hats; the full level faint behind */
     void columns( QPainter &p, int d, QRect r, double from, double to, int n )
     {
-        QVector<float> low( n ), full( n );
+        QVector<float> low( n ), full( n ), mid( n ), high( n );
         if( !host || !host->wave( d, from, to, n, low.data(), full.data() ) ) return;
-        QColor c = ink( d ), soft = c;
-        soft.setAlpha( c.alpha() * 2 / 5 );
-        QVector<QLineF> a, b;
-        double mid = r.center().y() + .5, half = r.height() / 2. - 1, dx = (double)r.width() / n;
+        bool bands = host->bands( d, from, to, n, mid.data(), high.data() );
+        const dj_status_t *st = &now->st;
+        int alpha = st->live == d ? 255 : 130;
+        QColor cl = palette().color( QPalette::Highlight ), cm( 0xff, 0x88, 0x00 ), ch( 0xf4, 0xe8, 0xd8 ), cf = palette().color( QPalette::Text );
+        cl.setAlpha( alpha );
+        cm.setAlpha( alpha * 3 / 5 );
+        ch.setAlpha( alpha * 9 / 10 );
+        cf.setAlpha( alpha / 6 );
+        QVector<QLineF> a, b, c, e;
+        double y0 = r.center().y() + .5, half = r.height() / 2. - 1, dx = (double)r.width() / n;
+        auto bar = [&]( QVector<QLineF> &v, double x, float h, float g ) {
+            if( h < 0.f ) return;
+            double k = half * qMin( h * g, 1.f );
+            v << QLineF( x, y0 - k, x, y0 + k );
+        };
         for( int i = 0; i < n; i++ )
         {
             double x = r.x() + (i + .5) * dx;
-            if( full[i] >= 0.f ) a << QLineF( x, mid - half * qMin( full[i], 1.f ), x, mid + half * qMin( full[i], 1.f ) );
-            if( low[i] >= 0.f ) b << QLineF( x, mid - half * qMin( low[i], 1.f ), x, mid + half * qMin( low[i], 1.f ) );
+            bar( a, x, full[i], 1.f );
+            bar( b, x, low[i], 1.f );
+            if( bands ) { bar( c, x, mid[i], 1.2f ); bar( e, x, high[i], 2.5f ); }
         }
-        p.setPen( QPen( soft, dx ) );
+        p.setPen( QPen( cf, dx ) );
         p.drawLines( a );
-        p.setPen( QPen( c, dx ) );
+        p.setPen( QPen( cm, dx ) );   /* the mids behind, the bass over them: the kick reads */
+        p.drawLines( c );
+        p.setPen( QPen( cl, dx ) );
         p.drawLines( b );
+        p.setPen( QPen( ch, dx * .6 ) );
+        p.drawLines( e );
     }
 
     void lane( QPainter &p, int d, QRect r )
@@ -442,6 +470,33 @@ protected:
             for( double g = R - 8.; g > R * .38; g -= 2.5 )
                 p.drawEllipse( QPointF( 0., 0. ), g, g );
             QColor label = st->live == d ? pal.color( QPalette::Highlight ) : QColor( 0x8c, 0x8c, 0x8c );
+            QString path = qfu( in->t.art ? in->t.art : "" );
+            if( path != artPath )   /* the cover, once per record, cut square for the label */
+            {
+                artPath = path;
+                QImage img = path.isEmpty() || path.startsWith( "http" ) ? QImage() : QImage( path );
+                int e = qMin( img.width(), img.height() );
+                cover = e > 0 ? QPixmap::fromImage( img.copy( (img.width() - e) / 2, (img.height() - e) / 2, e, e )
+                                    .scaled( 160, 160, Qt::IgnoreAspectRatio, Qt::SmoothTransformation ) ) : QPixmap();
+            }
+            if( !cover.isNull() )
+            {
+                double cr = R * .44;
+                QPainterPath round;
+                round.addEllipse( QPointF( 0., 0. ), cr, cr );
+                p.save();
+                p.setClipPath( round );
+                p.drawPixmap( QRectF( -cr, -cr, 2 * cr, 2 * cr ), cover, QRectF( cover.rect() ) );
+                p.restore();
+                p.setPen( QPen( label, 2. ) );
+                p.setBrush( Qt::NoBrush );
+                p.drawEllipse( QPointF( 0., 0. ), cr, cr );
+                p.setPen( Qt::NoPen );
+                p.setBrush( QColor( 0x10, 0x10, 0x10 ) );
+                p.drawEllipse( QPointF( 0., 0. ), 2.2, 2.2 );
+                p.restore();
+                goto sheen;
+            }
             p.setPen( Qt::NoPen );
             p.setBrush( label );
             p.drawEllipse( QPointF( 0., 0. ), R * .33, R * .33 );
@@ -457,6 +512,7 @@ protected:
             p.drawEllipse( QPointF( 0., 0. ), 1.8, 1.8 );
         }
         p.restore();
+    sheen:
         if( loaded )   /* the light on the vinyl stays where the lamp is */
         {
             QConicalGradient sheen( c, 45. );
@@ -501,6 +557,8 @@ private:
     const DjRecords *rec;
     int d;
     double angle, arm;
+    QString artPath;
+    QPixmap cover;
 };
 
 /* a channel's level, as VLC's volume shows it, green to red, the peak held a moment */
@@ -572,8 +630,282 @@ static QString runner()
     return qtr( "%1, effort %2" ).arg( model, effort.isEmpty() ? qtr( "default" ) : effort );
 }
 
+#if defined(_WIN32) && defined(__has_include) && QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
+# if __has_include(<windows.media.h>) && __has_include(<systemmediatransportcontrolsinterop.h>)
+#  define DJ_SMTC 1
+# endif
+#endif
+#ifdef DJ_SMTC
+# include <QPointer>
+# include <roapi.h>
+# include <winstring.h>
+# include <windows.media.h>
+# include <systemmediatransportcontrolsinterop.h>
+using namespace ABI::Windows::Media;
+typedef ABI::Windows::Foundation::ITypedEventHandler<SystemMediaTransportControls *,
+        SystemMediaTransportControlsButtonPressedEventArgs *> DjPressedHandler;
+
+/* Windows' media flyout and its keys: what the DJ plays, Next mixes, Previous is the DJ's
+   choice. combase is asked at run time, so a VLC built without these headers still links */
+class DjMedia : public DjPressedHandler
+{
+public:
+    static DjMedia *make( DjDeck *deck, HWND hwnd )
+    {
+        HMODULE cb = GetModuleHandleW( L"combase.dll" );
+        if( !cb ) cb = LoadLibraryW( L"combase.dll" );
+        DjMedia *m = cb ? new DjMedia( deck, cb ) : NULL;
+        if( m && !m->open( hwnd ) ) { m->close(); m->Release(); m = NULL; }
+        return m;
+    }
+
+    void close()
+    {
+        if( smtc )
+        {
+            if( token.value ) smtc->remove_ButtonPressed( token );
+            smtc->put_IsEnabled( false );
+            smtc->Release();
+            smtc = NULL;
+        }
+    }
+
+    void show( bool on, bool playing, const QString &title, const QString &artist, const QString &album )
+    {
+        if( !smtc ) return;
+        QString key = QString( "%1%2|%3|%4|%5" ).arg( on ).arg( playing ).arg( title, artist, album );
+        if( key == last ) return;
+        last = key;
+        smtc->put_IsEnabled( on );
+        if( !on ) return;
+        smtc->put_PlaybackStatus( playing ? MediaPlaybackStatus_Playing : MediaPlaybackStatus_Paused );
+        ISystemMediaTransportControlsDisplayUpdater *up = NULL;
+        if( FAILED( smtc->get_DisplayUpdater( &up ) ) || !up ) return;
+        up->put_Type( MediaPlaybackType_Music );
+        IMusicDisplayProperties *mp = NULL;
+        if( SUCCEEDED( up->get_MusicProperties( &mp ) ) && mp )
+        {
+            HSTRING h;
+            if( hs( title, &h ) ) { mp->put_Title( h ); del( h ); }
+            if( hs( artist, &h ) ) { mp->put_Artist( h ); del( h ); }
+            IMusicDisplayProperties2 *mp2 = NULL;   /* the album line: the DJ and the hour */
+            if( SUCCEEDED( mp->QueryInterface( __uuidof( IMusicDisplayProperties2 ), (void **)&mp2 ) ) && mp2 )
+            {
+                if( hs( album, &h ) ) { mp2->put_AlbumTitle( h ); del( h ); }
+                mp2->Release();
+            }
+            mp->Release();
+        }
+        up->Update();
+        up->Release();
+    }
+
+    /* IUnknown, and agile: Windows calls from its own threads */
+    HRESULT STDMETHODCALLTYPE QueryInterface( REFIID iid, void **out ) Q_DECL_OVERRIDE
+    {
+        if( iid == __uuidof( IUnknown ) || iid == __uuidof( IAgileObject ) || iid == __uuidof( DjPressedHandler ) )
+        {
+            *out = static_cast<DjPressedHandler *>( this );
+            AddRef();
+            return S_OK;
+        }
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() Q_DECL_OVERRIDE { return InterlockedIncrement( &refs ); }
+    ULONG STDMETHODCALLTYPE Release() Q_DECL_OVERRIDE
+    {
+        LONG n = InterlockedDecrement( &refs );
+        if( n == 0 ) delete this;
+        return n;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke( ISystemMediaTransportControls *,
+                                      ISystemMediaTransportControlsButtonPressedEventArgs *args ) Q_DECL_OVERRIDE
+    {
+        SystemMediaTransportControlsButton b;
+        if( FAILED( args->get_Button( &b ) ) ) return S_OK;
+        const char *verb = b == SystemMediaTransportControlsButton_Next ? "next"
+                         : b == SystemMediaTransportControlsButton_Previous ? "choose"
+                         : b == SystemMediaTransportControlsButton_Play || b == SystemMediaTransportControlsButton_Pause ? "pause" : NULL;
+        QPointer<DjDeck> d = deck;
+        if( verb && d )
+            QMetaObject::invokeMethod( d, [d, verb]() { if( d ) d->remote( verb ); }, Qt::QueuedConnection );
+        return S_OK;
+    }
+
+private:
+    typedef HRESULT (WINAPI *factory_fn)( HSTRING, REFIID, void ** );
+    typedef HRESULT (WINAPI *mkstr_fn)( PCNZWCH, UINT32, HSTRING * );
+    typedef HRESULT (WINAPI *delstr_fn)( HSTRING );
+
+    DjMedia( DjDeck *d, HMODULE cb ) : refs( 1 ), deck( d ), smtc( NULL )
+    {
+        token.value = 0;
+        factory = (factory_fn)(void *)GetProcAddress( cb, "RoGetActivationFactory" );
+        mkstr = (mkstr_fn)(void *)GetProcAddress( cb, "WindowsCreateString" );
+        delstr = (delstr_fn)(void *)GetProcAddress( cb, "WindowsDeleteString" );
+    }
+
+    bool hs( const QString &q, HSTRING *h )
+    {
+        std::wstring w = q.toStdWString();
+        return mkstr && SUCCEEDED( mkstr( w.c_str(), (UINT32)w.size(), h ) );
+    }
+    void del( HSTRING h ) { if( delstr ) delstr( h ); }
+
+    bool open( HWND hwnd )
+    {
+        if( !factory || !mkstr || !delstr ) return false;
+        HSTRING cls;
+        std::wstring name = L"Windows.Media.SystemMediaTransportControls";
+        if( FAILED( mkstr( name.c_str(), (UINT32)name.size(), &cls ) ) ) return false;
+        ISystemMediaTransportControlsInterop *interop = NULL;
+        HRESULT hr = factory( cls, __uuidof( ISystemMediaTransportControlsInterop ), (void **)&interop );
+        delstr( cls );
+        if( FAILED( hr ) || !interop ) return false;
+        hr = interop->GetForWindow( hwnd, __uuidof( ISystemMediaTransportControls ), (void **)&smtc );
+        interop->Release();
+        if( FAILED( hr ) || !smtc ) { smtc = NULL; return false; }
+        smtc->put_IsPlayEnabled( true );
+        smtc->put_IsPauseEnabled( true );
+        smtc->put_IsNextEnabled( true );
+        smtc->put_IsPreviousEnabled( true );
+        smtc->add_ButtonPressed( this, &token );
+        return true;
+    }
+
+    LONG refs;
+    QPointer<DjDeck> deck;
+    ISystemMediaTransportControls *smtc;
+    EventRegistrationToken token;
+    factory_fn factory;
+    mkstr_fn mkstr;
+    delstr_fn delstr;
+    QString last;
+};
+#endif
+
+/* the booth on the big screen: the records, the turntables and the DJ, large, dark, nothing to
+   press; Esc or a double-click leaves it */
+class DjStage : public QWidget
+{
+public:
+    DjStage( const DjNow *n, const DjPersona *pe, QWidget *parent )
+        : QWidget( parent, Qt::Window ), now( n ), persona( pe )
+    {
+        setWindowTitle( qtr( "DJ" ) );
+        QPalette pal = palette();
+        pal.setColor( QPalette::Window, QColor( 0x10, 0x10, 0x10 ) );
+        pal.setColor( QPalette::WindowText, QColor( 0xee, 0xee, 0xee ) );
+        pal.setColor( QPalette::Text, QColor( 0xee, 0xee, 0xee ) );
+        pal.setColor( QPalette::Button, QColor( 0x22, 0x22, 0x22 ) );
+        pal.setColor( QPalette::Mid, QColor( 0x44, 0x44, 0x44 ) );
+        pal.setColor( QPalette::Base, QColor( 0x16, 0x16, 0x16 ) );
+        setPalette( pal );
+        setAutoFillBackground( true );
+        records = new DjRecords( n, this );
+        avatar = new DjAvatar( n, records, pe, this );
+        avatar->setFixedSize( 180, 200 );
+        for( int d = 0; d < 2; d++ )
+        {
+            table[d] = new DjTurntable( n, records, d, this );
+            table[d]->setFixedSize( 300, 348 );
+        }
+        name = new QLabel;
+        title = new QLabel;
+        mix = new QLabel;
+        QFont f = font();
+        f.setPointSizeF( f.pointSizeF() * 3. );
+        f.setBold( true );
+        name->setFont( f );
+        f.setPointSizeF( f.pointSizeF() * .6 );
+        f.setBold( false );
+        title->setFont( f );
+        mix->setFont( f );
+        mix->setAlignment( Qt::AlignCenter );
+        QVBoxLayout *v = new QVBoxLayout( this );
+        v->setContentsMargins( 40, 30, 40, 30 );
+        QHBoxLayout *top = new QHBoxLayout;
+        top->addWidget( avatar );
+        QVBoxLayout *who = new QVBoxLayout;
+        who->addStretch();
+        who->addWidget( name );
+        who->addWidget( title );
+        who->addStretch();
+        top->addLayout( who, 1 );
+        v->addLayout( top );
+        v->addWidget( records, 1 );
+        QHBoxLayout *low = new QHBoxLayout;
+        low->addWidget( table[0] );
+        low->addWidget( mix, 1 );
+        low->addWidget( table[1] );
+        v->addLayout( low );
+        setToolTip( qtr( "Esc or a double-click leaves the full screen" ) );
+        /* the style hands each kind of widget its own palette: the dark one goes to each */
+        for( QWidget *w : findChildren<QWidget *>() ) w->setPalette( pal );
+    }
+
+    void setHost( const dj_host_t *h ) { records->host = h; }
+
+    void tick( double dt )
+    {
+        records->follow( dt );
+        records->update();
+        for( int d = 0; d < 2; d++ ) table[d]->step( dt );
+        avatar->update();
+        const dj_status_t *st = &now->st;
+        name->setText( persona->name.isEmpty() ? qtr( "DJ" ) : persona->name );
+        if( st->live >= 0 && st->live < DJ_DECKS )
+        {
+            const dj_deck_info_t *lv = &st->deck[st->live];
+            QString t = qfu( lv->now_playing && *lv->now_playing ? lv->now_playing : lv->t.title ? lv->t.title : "" );
+            if( lv->t.artist && !(lv->now_playing && *lv->now_playing) ) t = qfu( lv->t.artist ) + " - " + t;
+            title->setText( t );
+        }
+        QString m = st->running ? qtr( "Mixing" ) : st->armed ? qtr( "Next mix in %1 s" ).arg( (int)st->starts_in_s ) : QString();
+        if( st->live >= 0 && st->live < DJ_DECKS && st->deck[st->live].grid.period > 0. )
+            m += (m.isEmpty() ? QString() : "\n") + QString( "%1 BPM" ).arg( st->deck[st->live].grid.bpm * st->deck[st->live].rate, 0, 'f', 1 );
+        if( st->live >= 0 && st->live < DJ_DECKS && st->deck[st->live].length_s > 0. )
+            m += (m.isEmpty() ? QString() : "\n") + qfu( "\xe2\x88\x92" ) + clock( st->deck[st->live].length_s - records->shown[st->live] );
+        mix->setText( m );
+    }
+
+    /* on a screen of its own when there is one: the TV, not the desk */
+    void enter( QWidget *from )
+    {
+        QPoint at = from->window()->frameGeometry().center();
+        QScreen *pick = NULL;
+        for( QScreen *s : QGuiApplication::screens() )
+            if( !s->geometry().contains( at ) ) { pick = s; break; }
+        if( pick )   /* a child window follows its parent's screen unless its own is set */
+        {
+            create();
+            windowHandle()->setScreen( pick );
+            setGeometry( pick->geometry() );
+        }
+        showFullScreen();
+        activateWindow();
+    }
+
+protected:
+    void keyPressEvent( QKeyEvent *e ) Q_DECL_OVERRIDE
+    {
+        if( e->key() == Qt::Key_Escape || e->key() == Qt::Key_F11 ) close();
+        else QWidget::keyPressEvent( e );
+    }
+    void mouseDoubleClickEvent( QMouseEvent * ) Q_DECL_OVERRIDE { close(); }
+
+private:
+    const DjNow *now;
+    const DjPersona *persona;
+    DjRecords *records;
+    DjAvatar *avatar;
+    DjTurntable *table[2];
+    QLabel *name, *title, *mix;
+};
+
 DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
-    : QWidget( parent ), p_intf( _p_intf ), host( NULL ), now( new DjNow ), persona( new DjPersona ), ticks( 0 )
+    : QWidget( parent ), p_intf( _p_intf ), host( NULL ), now( new DjNow ), persona( new DjPersona ), ticks( 0 ), media( NULL )
 {
     memset( now, 0, sizeof *now );
     QVBoxLayout *main = new QVBoxLayout( this );
@@ -610,7 +942,6 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
     stage->setFont( big );
     card->setSizePolicy( QSizePolicy::Ignored, QSizePolicy::Preferred );
     quiet( card );
-    persona->run = runner();
     QHBoxLayout *ident = new QHBoxLayout;
     ident->addWidget( stage );
     ident->addSpacing( 8 );
@@ -632,6 +963,26 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
     head->addWidget( air, 0, Qt::AlignTop );
     head->addSpacing( 6 );
     head->addWidget( voice, 0, Qt::AlignTop );
+    recBtn = new QPushButton( QIcon( ":/toolbar/record.svg" ), qtr( "Record" ) );
+    recBtn->setCheckable( true );
+    recBtn->setAccessibleName( qtr( "Record the set" ) );   /* its text counts the time */
+    recBtn->setToolTip( qtr( "Record the set: what the room hears, into the VLC DJ folder in Music, as FLAC" ) );
+    connect( recBtn, &QPushButton::toggled, this, [this]( bool on ) {
+        recBtn->setProperty( "asked", (qlonglong)mdate() );
+        command( on ? "record?on=1" : "record?on=0" );
+    } );
+    stageBtn = new QPushButton( QIcon( ":/toolbar/fullscreen.svg" ), QString() );
+    stageBtn->setToolTip( qtr( "Full screen: the booth on the other screen, the TV" ) );
+    stageBtn->setAccessibleName( qtr( "Full screen" ) );
+    stageWin = NULL;
+    connect( stageBtn, &QPushButton::clicked, this, [this]() {
+        if( stageWin == NULL ) { stageWin = new DjStage( now, persona, this ); stageWin->setHost( host ); }
+        stageWin->enter( this );
+        if( host ) timer->start();
+    } );
+    head->addSpacing( 6 );
+    head->addWidget( recBtn, 0, Qt::AlignTop );
+    head->addWidget( stageBtn, 0, Qt::AlignTop );
     main->addLayout( head );
     main->addWidget( records, 3 );
 
@@ -674,6 +1025,24 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
         s.progress->setMaximumHeight( 4 );
         v->addWidget( s.progress );
         s.meter = new DjMeter( this );
+        /* the deck's bass, the listener's to turn; it stays for the record */
+        s.bass = new QDial;
+        s.bass->setRange( -26, 6 );
+        s.bass->setNotchesVisible( true );
+        s.bass->setAccessibleName( d ? qtr( "Deck B low EQ" ) : qtr( "Deck A low EQ" ) );
+        s.bass->setFixedSize( 40, 40 );
+        s.bass->setToolTip( qtr( "Low EQ: turn the bass of this deck; it stays until the record changes. Double-click: flat" ) );
+        s.bass->installEventFilter( this );
+        connect( s.bass, &QDial::valueChanged, this, [this, d]( int v ) {
+            command( QString( "bass?deck=%1&db=%2" ).arg( d ).arg( v ) );
+        } );
+        QVBoxLayout *knob = new QVBoxLayout;
+        knob->addStretch();
+        knob->addWidget( s.bass, 0, Qt::AlignHCenter );
+        QLabel *low = new QLabel( qtr( "Low" ) );
+        quiet( low );
+        knob->addWidget( low, 0, Qt::AlignHCenter );
+        hv->insertLayout( d == 0 ? 1 : 1, knob );
     }
     QHBoxLayout *mh = new QHBoxLayout( mix );
     QVBoxLayout *m = new QVBoxLayout;
@@ -682,8 +1051,16 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
     transition->setSizePolicy( QSizePolicy::Ignored, QSizePolicy::Preferred );
     xfade = new QSlider( Qt::Horizontal );
     xfade->setRange( -100, 100 );
-    xfade->setEnabled( false );   /* the DJ's hand on it, not ours */
-    xfade->setToolTip( qtr( "The crossfader: deck A to the left, deck B to the right" ) );
+    xfade->setAccessibleName( qtr( "Crossfader" ) );
+    xfade->setToolTip( qtr( "The crossfader: deck A to the left, deck B to the right. Drag it to take it; "
+                             "the DJ carries on from where you leave it and takes it back at its next mix" ) );
+    connect( xfade, &QSlider::valueChanged, this, [this]( int v ) {
+        command( QString( "fader?x=%1" ).arg( v / 100., 0, 'f', 2 ) );
+    } );
+    giveBack = new QPushButton( qtr( "Give the fader back" ) );
+    giveBack->setFlat( true );
+    giveBack->hide();
+    connect( giveBack, &QPushButton::clicked, this, [this]() { command( "fader?x=dj" ); } );
     sync = new QLabel;   /* how close the beats are in a blend */
     sync->setAlignment( Qt::AlignCenter );
     quiet( sync );
@@ -703,6 +1080,7 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
     m->addStretch();
     m->addWidget( xfade );
     m->addLayout( ab );
+    m->addWidget( giveBack, 0, Qt::AlignHCenter );
     mh->addWidget( side[0].meter );
     mh->addLayout( m, 1 );
     mh->addWidget( side[1].meter );
@@ -713,13 +1091,23 @@ DjDeck::DjDeck( intf_thread_t *_p_intf, QWidget *parent )
 
     /* what comes next, the moods, a request */
     QHBoxLayout *bottom = new QHBoxLayout;
-    QGroupBox *next = new QGroupBox( qtr( "Up next" ) );
+    QTabWidget *next = new QTabWidget;
     upNext = new QListWidget;
     upNext->setSelectionMode( QAbstractItemView::NoSelection );
     upNext->setFocusPolicy( Qt::NoFocus );
     upNext->setTextElideMode( Qt::ElideRight );
     upNext->setHorizontalScrollBarPolicy( Qt::ScrollBarAlwaysOff );
-    (new QVBoxLayout( next ))->addWidget( upNext );
+    upNext->setToolTip( qtr( "Double-click a record to play it next" ) );
+    connect( upNext, &QListWidget::itemDoubleClicked, this, [this]( QListWidgetItem *it ) {
+        command( QString( "up?i=%1" ).arg( upNext->row( it ) ) );
+    } );
+    next->addTab( upNext, qtr( "Up next" ) );
+    played = new QListWidget;   /* what played, newest first, each with a vote */
+    played->setSelectionMode( QAbstractItemView::NoSelection );
+    played->setFocusPolicy( Qt::NoFocus );
+    played->setHorizontalScrollBarPolicy( Qt::ScrollBarAlwaysOff );
+    played->setToolTip( qtr( "Your votes go to the DJ's taste file; a thumbs down on what is playing mixes it out" ) );
+    next->addTab( played, qtr( "Played" ) );
     moodBox = new QGroupBox( qtr( "Moods" ) );
     moodGrid = new QGridLayout( moodBox );
     QGroupBox *req = new QGroupBox( qtr( "Request" ) );
@@ -782,7 +1170,9 @@ void DjDeck::dress()
 {
     QFileInfo fi( persona->path );
     QDateTime at = fi.exists() ? fi.lastModified() : QDateTime();
-    if( at == persona->stamp && !persona->stamp.isNull() ) return;
+    QString run = runner();   /* the agent's model and effort may change too */
+    if( at == persona->stamp && !persona->stamp.isNull() && run == persona->run ) return;
+    persona->run = run;
     persona->stamp = at;
     persona->name.clear();
     persona->tagline.clear();
@@ -810,7 +1200,7 @@ void DjDeck::dress()
         }
     }
     stage->setText( persona->name.isEmpty() ? qtr( "DJ" ) : persona->name );
-    QString run = persona->run.isEmpty() ? qtr( "the dj module" ) : persona->run;
+    run = persona->run.isEmpty() ? qtr( "the dj module" ) : persona->run;
     card->setText( persona->tagline.isEmpty() ? run : persona->tagline + qfu( " \xc2\xb7 " ) + run );
     QString about = qtr( "The DJ in VLC is the dj module: it keeps the programme, picks the records and mixes them." );
     if( !persona->run.isEmpty() ) about += " " + qtr( "Requests from Claude go through the dj agent: %1." ).arg( persona->run );
@@ -828,6 +1218,9 @@ DjDeck::~DjDeck()
     if( h ) h->detach();   /* the DJ shows its own deck again, should anyone ask */
     var_Destroy( THEPL, DJ_HOST_VAR );
     if( now->have && host ) host->status_clean( &now->st );
+#ifdef DJ_SMTC
+    if( media ) { static_cast<DjMedia *>( media )->close(); static_cast<DjMedia *>( media )->Release(); }
+#endif
     delete now;
     delete persona;
 }
@@ -858,8 +1251,12 @@ void DjDeck::attach()
     bool changed = (h != NULL) != (host != NULL);
     host = h;
     records->host = h;
-    if( host && isVisible() )
+    if( stageWin ) stageWin->setHost( h );
+    if( host )   /* hidden, once a second: the media flyout */
+    {
+        timer->setInterval( isVisible() ? 33 : 1000 );
         timer->start();
+    }
     if( changed )
         emit availabilityChanged( host != NULL );
 }
@@ -874,7 +1271,7 @@ void DjDeck::showEvent( QShowEvent *e )
 
 void DjDeck::hideEvent( QHideEvent *e )
 {
-    timer->stop();
+    if( !stageWin || !stageWin->isVisible() ) timer->setInterval( 1000 );   /* the flyout still follows */
     QWidget::hideEvent( e );
 }
 
@@ -886,7 +1283,16 @@ void DjDeck::tick()
     if( !now->have ) return;
     mtime_t t = mdate();
     double dt = now->at ? (t - now->at) / (double)CLOCK_FREQ : 0.;
+    if( !isVisible() && !(stageWin && stageWin->isVisible()) )
+    {
+        now->at = t;
+        flyout();
+        return;
+    }
+    timer->setInterval( 33 );
+    if( ticks % 30 == 0 ) flyout();
     records->follow( dt );
+    if( stageWin && stageWin->isVisible() ) stageWin->tick( dt );
     now->at = t;
     records->update();
     const dj_status_t *st = &now->st;
@@ -896,7 +1302,27 @@ void DjDeck::tick()
         side[d].meter->feed( in->state != DJ_EMPTY && in->gain > 0.f ? in->level_db : -120.f, t );
         side[d].turntable->step( dt );
     }
-    xfade->setValue( (int)lroundf( st->xfade * 100.f ) );
+    if( !xfade->isSliderDown() )   /* the listener's hand where it was left, else the DJ's */
+    {
+        QSignalBlocker quietly( xfade );
+        xfade->setValue( (int)lroundf( (st->hand ? st->hand_x : st->xfade) * 100.f ) );
+    }
+    giveBack->setVisible( st->hand );
+    bool recording = st->rec_s >= 0.;   /* the DJ's word, three seconds after the listener's */
+    if( recording != recBtn->isChecked() && mdate() - recBtn->property( "asked" ).toLongLong() > 3 * CLOCK_FREQ )
+    {
+        QSignalBlocker quietly( recBtn );
+        recBtn->setChecked( recording );
+    }
+    {
+        recBtn->setText( st->rec_s >= 0. ? qtr( "Recording %1" ).arg( clock( st->rec_s ) ) : qtr( "Record" ) );
+    }
+    for( int d = 0; d < 2; d++ )
+        if( !side[d].bass->isSliderDown() )
+        {
+            QSignalBlocker quietly( side[d].bass );
+            side[d].bass->setValue( (int)lroundf( st->deck[d].hand_low_db ) );
+        }
     for( int d = 0; d < 2; d++ )
     {
         const dj_deck_info_t *in = &st->deck[d];
@@ -923,6 +1349,35 @@ static void elide( QLabel *l, const QString &s )
     l->setToolTip( s.length() > 40 ? s : QString() );
 }
 
+/* a double-click sets a knob flat, as on a mixer's detent */
+bool DjDeck::eventFilter( QObject *o, QEvent *e )
+{
+    if( e->type() == QEvent::MouseButtonDblClick )
+        for( int d = 0; d < 2; d++ )
+            if( o == side[d].bass ) { side[d].bass->setValue( 0 ); return true; }
+    return QWidget::eventFilter( o, e );
+}
+
+/* what the DJ plays, on Windows' media flyout and its keys */
+void DjDeck::flyout()
+{
+#ifdef DJ_SMTC
+    if( !media && window()->windowHandle() ) media = DjMedia::make( this, (HWND)window()->winId() );
+    if( !media ) return;
+    const dj_status_t *st = &now->st;
+    bool on = now->br.on_air && st->attached && st->live >= 0 && st->live < DJ_DECKS;
+    QString title, artist, album;
+    if( on )
+    {
+        const dj_deck_info_t *lv = &st->deck[st->live];
+        title = qfu( lv->now_playing && *lv->now_playing ? lv->now_playing : lv->t.title ? lv->t.title : "" );
+        artist = lv->now_playing && *lv->now_playing ? qfu( lv->t.title ? lv->t.title : "" ) : qfu( lv->t.artist ? lv->t.artist : "" );
+        album = (persona->name.isEmpty() ? qtr( "DJ" ) : persona->name) + qfu( " \xc2\xb7 " ) + qfu( now->br.block );
+    }
+    static_cast<DjMedia *>( media )->show( on, !st->paused, title, artist, album );
+#endif
+}
+
 void DjDeck::command( const QString &verb )
 {
     if( host ) host->command( qtu( verb ) );
@@ -944,6 +1399,71 @@ void DjDeck::mixNext()               { command( "next" ); }
 void DjDeck::choose()                { command( "choose" ); }
 
 /* the words, a few times a second */
+/* a record came on: the top of Played, with its thumbs */
+void DjDeck::heard( const QString &url, const QString &what, const QString &from )
+{
+    QListWidgetItem *it = new QListWidgetItem;
+    it->setData( Qt::UserRole, url );
+    it->setData( Qt::UserRole + 1, what );
+    it->setData( Qt::UserRole + 2, from );
+    played->insertItem( 0, it );
+    QWidget *row = new QWidget;
+    QHBoxLayout *h = new QHBoxLayout( row );
+    h->setContentsMargins( 4, 0, 2, 0 );
+    QLabel *l = new QLabel( QTime::currentTime().toString( "HH:mm" ) + "  " + what );
+    l->setSizePolicy( QSizePolicy::Ignored, QSizePolicy::Preferred );
+    l->setToolTip( what );
+    h->addWidget( l, 1 );
+    for( int up = 1; up >= 0; up-- )
+    {
+        QToolButton *b = new QToolButton;
+        b->setText( up ? qfu( "\xf0\x9f\x91\x8d" ) : qfu( "\xf0\x9f\x91\x8e" ) );
+        b->setAutoRaise( true );
+        b->setCheckable( true );
+        b->setObjectName( up ? "up" : "down" );
+        b->setToolTip( up ? qtr( "More like this" ) : qtr( "Not for me" ) );
+        connect( b, &QToolButton::clicked, this, [this, it, up]() { vote( it, up ); } );
+        h->addWidget( b );
+    }
+    it->setSizeHint( row->sizeHint() );
+    played->setItemWidget( it, row );
+    while( played->count() > 40 ) delete played->takeItem( played->count() - 1 );
+}
+
+/* a vote, once a record: into the taste file the DJ's agent reads, and the list the DJ in
+   VLC keeps off its crate */
+void DjDeck::vote( QListWidgetItem *it, bool up )
+{
+    QWidget *row = played->itemWidget( it );
+    QToolButton *mine = row->findChild<QToolButton *>( up ? "up" : "down" );
+    QToolButton *other = row->findChild<QToolButton *>( up ? "down" : "up" );
+    mine->setChecked( true );
+    other->setChecked( false );
+    if( it->data( Qt::UserRole + 3 ).toInt() == (up ? 1 : 2) ) return;
+    it->setData( Qt::UserRole + 3, up ? 1 : 2 );
+    QString url = it->data( Qt::UserRole ).toString(), what = it->data( Qt::UserRole + 1 ).toString();
+    QString from = it->data( Qt::UserRole + 2 ).toString();
+    QString stamp = QDateTime::currentDateTime().toString( "yyyy-MM-dd HH:mm" );
+    QFile taste( QCoreApplication::applicationDirPath() + "/dj/taste.md" );
+    if( taste.exists() && taste.open( QIODevice::ReadWrite | QIODevice::Text ) )
+    {
+        bool head = QString::fromUtf8( taste.readAll() ).contains( "\n## Votes" );
+        taste.seek( taste.size() );
+        QString line = QString( "- %1 %2: %3" ).arg( up ? "up" : "down", stamp, what );
+        if( !from.isEmpty() ) line += " (" + from + ")";
+        if( !head ) taste.write( "\n## Votes\n\nThe listener's thumbs from the DJ page, newest last.\n\n" );
+        taste.write( (line + "\n").toUtf8() );
+    }
+    char *dir = config_GetUserDir( VLC_CONFIG_DIR );
+    QFile votes( qfu( dir ? dir : "." ) + "/dj-votes.txt" );
+    free( dir );
+    if( votes.open( QIODevice::Append | QIODevice::Text ) )
+    {
+        votes.write( QString( "%1\t%2\t%3\n" ).arg( up ? "up" : "down", url, what ).toUtf8() );
+    }
+    if( !up && played->row( it ) == 0 && lastLive.startsWith( url ) ) command( "next" );
+}
+
 void DjDeck::words()
 {
     static const char *const states[] = { N_("Empty"), N_("Loading"), N_("Cued"), N_("Live"), N_("Done"), N_("Failed") };
@@ -952,6 +1472,20 @@ void DjDeck::words()
     const dj_brain_t *br = &now->br;
     const QString dot = qfu( " \xc2\xb7 " );
 
+    if( st->live >= 0 && st->live < DJ_DECKS && st->deck[st->live].t.url )
+    {
+        const dj_deck_info_t *lv = &st->deck[st->live];
+        QString url = qfu( lv->t.url ), np = qfu( lv->now_playing ? lv->now_playing : "" );
+        if( url + np != lastLive )   /* a station: each song it names */
+        {
+            const dj_track_t &t = lv->t;
+            QString what = t.artist ? qfu( t.artist ) + " - " : QString();
+            what += qfu( t.title ? t.title : "?" );
+            if( !np.isEmpty() ) what = np + qfu( " \xc2\xb7 " ) + what;
+            lastLive = url + np;
+            heard( url, what, qfu( t.label ? t.label : "" ) );
+        }
+    }
     block->setText( qfu( br->block ) );
     QString nb = br->next_block[0] ? qtr( "Next: %1 at %2" ).arg( qfu( br->next_block ), qfu( br->next_at ) ) : QString();
     if( persona->setFrom >= 0 )   /* the DJ's own set, its music only */

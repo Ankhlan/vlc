@@ -44,6 +44,10 @@ class QGroupBox;
 class QLineEdit;
 class QListWidget;
 class QSlider;
+class QDial;
+class QPushButton;
+class QListWidgetItem;
+class DjStage;
 class QProgressBar;
 class QGridLayout;
 class QTimer;
@@ -81,6 +85,12 @@ private:
     static int HostChanged( vlc_object_t *, const char *, vlc_value_t, vlc_value_t, void * );
     static void Show( void * );
     void command( const QString & );
+public:
+    void remote( const QString &verb ) { command( verb ); }
+private:
+    bool eventFilter( QObject *, QEvent * ) Q_DECL_OVERRIDE;
+    void heard( const QString &url, const QString &what, const QString &from );
+    void vote( QListWidgetItem *, bool up );
     void request( const QString &, bool queue );
     void words();
     void dress();
@@ -106,9 +116,15 @@ private:
         DjTurntable  *turntable;
         DjMeter      *meter;
         QProgressBar *progress;
+        QDial        *bass;
     } side[2];
     QSlider      *xfade;
-    QListWidget  *upNext;
+    QPushButton  *giveBack, *recBtn, *stageBtn;
+    DjStage      *stageWin;
+    void         *media;          /* Windows' media flyout, when there is one */
+    void          flyout();
+    QListWidget  *upNext, *played;
+    QString       lastLive;
     QGroupBox    *moodBox;
     QGridLayout  *moodGrid;
     QStringList   moods, nexts;

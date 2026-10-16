@@ -42,6 +42,7 @@
 #include <QMessageBox>
 
 #include <assert.h>
+#include "../../control/dj_host.h"
 
 static int InputEvent( vlc_object_t *, const char *,
                        vlc_value_t, vlc_value_t, void * );
@@ -1106,18 +1107,31 @@ void MainInputManager::stop()
    playlist_Stop( THEPL );
 }
 
+/* while the DJ's mix plays, Next mixes in the next record and Previous asks for the DJ's
+   choice: the toolbar, the taskbar's buttons and the media keys alike */
+static bool dj_verb( intf_thread_t *p_intf, input_thread_t *p_input, const char *verb )
+{
+    input_item_t *item = p_input ? input_GetItem( p_input ) : NULL;
+    char *uri = item ? input_item_GetURI( item ) : NULL;
+    bool mix = uri && !strncmp( uri, "djmix:", 6 );
+    free( uri );
+    const dj_host_t *h = mix ? (const dj_host_t *)var_GetAddress( THEPL, DJ_HOST_VAR ) : NULL;
+    return h && h->command( verb );
+}
+
 void MainInputManager::next()
 {
-   playlist_Next( THEPL );
+   if( !dj_verb( p_intf, p_input, "next" ) ) playlist_Next( THEPL );
 }
 
 void MainInputManager::prev()
 {
-   playlist_Prev( THEPL );
+   if( !dj_verb( p_intf, p_input, "choose" ) ) playlist_Prev( THEPL );
 }
 
 void MainInputManager::prevOrReset()
 {
+    if( dj_verb( p_intf, p_input, "choose" ) ) return;
     if( !p_input || var_GetInteger( p_input, "time") < INT64_C(10000) )
         playlist_Prev( THEPL );
     else
